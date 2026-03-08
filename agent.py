@@ -337,8 +337,25 @@ def _choose_filler(text: str) -> str:
     return random.choice(FILLER_GENERAL)
 
 
-def _needs_filler(text: str) -> bool:
-    """Return True if a filler phrase should be sent for this user input."""
+def _needs_filler(text: str, state: Optional[PatientState] = None) -> bool:
+    """Return True if a filler phrase should be sent for this user input.
+
+    Accepts optional state for context-aware suppression:
+    - Suppresses when booking is already in progress or done.
+    - Suppresses when there is a pending confirmation AND the text resolves to yes/no
+      (even for longer phrases like "Alright. Yeah. Sure, please.").
+    """
+    # --- State-aware suppression (highest priority) ---
+    if state is not None:
+        if getattr(state, "booking_in_progress", False):
+            return False
+        if getattr(state, "appointment_booked", False) or getattr(state, "booking_confirmed", False):
+            return False
+        # Pending confirmation + clear yes/no intent → deterministic path owns this turn
+        if state.pending_confirm_field or state.pending_confirm:
+            if resolve_confirmation_intent(text.lower()) is not None:
+                return False
+
     lower = text.strip().lower()
     words = lower.split()
     # Skip for yes/no
@@ -643,17 +660,22 @@ async def entrypoint(ctx: JobContext):
             task.cancel()
         _clear_scheduled_filler()
 
-    def _interrupt_filler():
+    def _interrupt_filler(force: bool = False):
+        """Interrupt a currently active filler. Pass force=True to skip the age guard."""
         sent_at = _filler_state.get("sent_at", 0.0)
         age_ms = (time.perf_counter() - sent_at) * 1000
-        if _filler_state.get("active") and age_ms < 300:
+        if not force and _filler_state.get("active") and age_ms < 300:
             logger.debug(f"[FILLER] Skipping interrupt — filler too young ({age_ms:.0f}ms)")
             return
         h = _filler_state.get("handle")
         if h:
             try:
                 if hasattr(h, "interrupt"):
-                    h.interrupt()
+                    try:
+                        h.interrupt(force=True)
+                    except TypeError:
+                        h.interrupt()
+                logger.info(f"[FILLER INTERRUPTED] '{_filler_state.get('text', '')}' age={age_ms:.0f}ms")
             except Exception:
                 pass
         _clear_filler_state()
@@ -662,29 +684,44 @@ async def entrypoint(ctx: JobContext):
         _t0 = time.perf_counter()
         handle = None
         try:
-            # session.say() returns SpeechHandle synchronously.
-            # Do NOT await, do NOT create_task, do NOT inspect.isawaitable.
-            # allow_interruptions=True so LLM response can cut in when ready.
-            handle = session.say(text, allow_interruptions=True)
+            # allow_interruptions=False: prevents the session from preempting filler
+            # before any audio plays. We interrupt it ourselves after FILLER_MAX_DURATION_MS.
+            # add_to_chat_ctx=False: fillers must not appear in LLM conversation history.
+            try:
+                handle = session.say(text, allow_interruptions=False, add_to_chat_ctx=False)
+            except TypeError:
+                # Older SDK versions may not accept add_to_chat_ctx — fall back gracefully.
+                handle = session.say(text, allow_interruptions=False)
             _filler_state["handle"] = handle
             _filler_state["active"] = True
             _filler_state["sent_at"] = _t0
             _filler_state["text"] = text
+            logger.info(f"[FILLER QUEUED] '{text}'")
+
+            # Small yield so speech can start before the timebox countdown begins.
+            await asyncio.sleep(0.05)
             logger.info(f"[FILLER STARTED] '{text}'")
 
-            # Let filler play for up to FILLER_MAX_DURATION_MS, then interrupt
-            await asyncio.sleep(FILLER_MAX_DURATION_MS / 1000.0)
+            # Let filler play for remaining time, then manually interrupt.
+            remaining_ms = max(0, FILLER_MAX_DURATION_MS - 50)
+            await asyncio.sleep(remaining_ms / 1000.0)
 
             if _filler_state.get("handle") is handle and _filler_state.get("active"):
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info(f"[FILLER TIMEBOX] '{text}' reached {_ms:.0f}ms, interrupting")
                 if hasattr(handle, "interrupt"):
-                    handle.interrupt()
+                    try:
+                        handle.interrupt(force=True)
+                    except TypeError:
+                        handle.interrupt()
         except asyncio.CancelledError:
             _ms = (time.perf_counter() - _t0) * 1000
             logger.info(f"[FILLER CANCELLED] '{text}' after {_ms:.0f}ms")
             if handle and hasattr(handle, "interrupt"):
-                handle.interrupt()
+                try:
+                    handle.interrupt(force=True)
+                except TypeError:
+                    handle.interrupt()
         except Exception as e:
             logger.debug(f"[FILLER ERROR] '{text}': {e}")
         finally:
@@ -729,9 +766,14 @@ async def entrypoint(ctx: JobContext):
         # wasting CPU and (for some SDK versions) causing a ChatContext rebuild.
         # Memory is now only refreshed inside tool calls that actually mutate state.
 
+        # Reset turn_consumed for this new utterance. _on_user_input_confirmation
+        # (registered after this handler) will set it True if it owns the turn.
+        state.turn_consumed = False
+
         if not FILLER_ENABLED or _filler_state["active"]:
             return
-        if _needs_filler(text):
+        # Pass state so _needs_filler can suppress on confirmation turns.
+        if _needs_filler(text, state=state):
             _filler_state["scheduled_task"] = asyncio.create_task(_schedule_filler())
 
     session.on("user_input_transcribed", _on_user_transcribed)
@@ -846,10 +888,39 @@ async def entrypoint(ctx: JobContext):
         if confirm_intent is None:
             return
 
+        # ── Fingerprint deduplication: ignore repeated identical confirmations within 1.5s ──
+        raw_phone = state.phone_pending or state.phone_e164 or ""
+        fingerprint = f"{pending}|{text}|{state.dt_local}|{raw_phone}"
+        now_pc = time.perf_counter()
+        if (
+            getattr(state, "last_confirm_fingerprint", None) == fingerprint
+            and (now_pc - getattr(state, "last_confirm_ts", 0.0)) < 1.5
+        ):
+            logger.info("[CONFIRM] Duplicate confirmation ignored (same fingerprint within 1.5s)")
+            return
+        state.last_confirm_fingerprint = fingerprint
+        state.last_confirm_ts = now_pc
+
         logger.info(f"[CONFIRM] Deterministic routing: pending='{pending}', yes={confirm_intent}")
+
+        # ── Cancel any scheduled or active filler immediately (sync, before async task) ──
+        _cancel_scheduled_filler()
+        _interrupt_filler(force=True)
+
+        # Mark this turn as owned by the deterministic path.
+        state.turn_consumed = True
 
         async def _confirm_phone_async(confirmed: bool):
             t0 = time.perf_counter()
+            # Interrupt session auto-reply that may have started concurrently.
+            try:
+                sess = _session_refs.get("session")
+                if sess and hasattr(sess, "interrupt"):
+                    sess.interrupt()
+                    logger.debug("[CONFIRM] Session interrupted to prevent concurrent LLM reply")
+            except Exception as _ie:
+                logger.debug(f"[CONFIRM] Session interrupt failed: {_ie}")
+
             try:
                 await assistant_tools.confirm_phone(confirmed=confirmed)  # type: ignore[call-arg]
                 if confirmed:
@@ -863,14 +934,14 @@ async def entrypoint(ctx: JobContext):
                         refresh_agent_memory()  # update prompt so LLM knows booking is done
                         elapsed = (time.perf_counter() - t0) * 1000
                         logger.info(f"[CONFIRM] Fast-lane booking complete in {elapsed:.0f}ms")
-                        await session.say(booking_result)
+                        session.say(booking_result)
                     else:
                         # State incomplete — missing name, reason, or time.
                         # Let LLM decide what to ask next.
                         logger.info(f"[CONFIRM] Phone confirmed but state incomplete: {state.missing_slots()}")
                         await session.generate_reply()
                 else:
-                    await session.say("No problem! What number should I use instead?")
+                    session.say("No problem! What number should I use instead?")
             except Exception as e:
                 logger.error(f"[CONFIRM] Phone confirm error: {e}")
                 # Fallback: let LLM recover

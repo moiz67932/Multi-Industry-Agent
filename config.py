@@ -93,6 +93,7 @@ if not logger.handlers:
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(handler)
+    logger.propagate = False  # Prevent double-logging when root logger also has a StreamHandler
 
 # =============================================================================
 # ENVIRONMENT & APPLICATION CONFIG

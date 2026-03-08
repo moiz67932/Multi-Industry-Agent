@@ -122,6 +122,12 @@ class PatientState:
     # Terminal state
     call_ended: bool = False
 
+    # Booking idempotency guards
+    booking_in_progress: bool = False
+    last_confirm_fingerprint: Optional[str] = None
+    last_confirm_ts: float = 0.0
+    turn_consumed: bool = False
+
     # Context
     tz: str = DEFAULT_TZ
     patient_type: Optional[str] = None

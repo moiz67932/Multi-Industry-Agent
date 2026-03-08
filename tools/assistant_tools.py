@@ -674,12 +674,20 @@ class AssistantTools:
             if not state.phone_e164 or not state.phone_confirmed: missing.append("confirmed phone number")
             return f"I still need: {', '.join(missing)}. Let me get those first."
 
+        # --- Booking-in-progress mutex: prevents duplicate inserts from concurrent fast-lane tasks ---
+        if getattr(state, "booking_in_progress", False):
+            logger.info("[BOOK] Booking already in progress — ignoring duplicate call")
+            return "One moment — I'm finalizing your booking now."
+
+        state.booking_in_progress = True
         logger.info(f"[BOOK] Starting Supabase insert for {state.full_name}")
+        appt_id = None
         try:
             appt_id = await book_to_supabase(clinic_info, patient_state=state, calendar_event_id=None)
         except Exception as e:
             logger.error(f"[BOOK] Supabase failed: {e!r}")
-            appt_id = None
+        finally:
+            state.booking_in_progress = False
 
         if not appt_id:
             return "I'm having trouble saving the appointment. Could you try again?"
