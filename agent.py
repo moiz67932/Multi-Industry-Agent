@@ -79,6 +79,7 @@ from config import (
     logger,
     supabase,
     DEFAULT_TZ,
+    BOOKING_TZ,
     DEFAULT_PHONE_REGION,
     DEMO_CLINIC_ID,
     FILLER_ENABLED,
@@ -90,6 +91,15 @@ from config import (
     MAX_ENDPOINTING_DELAY,
     STT_AGGRESSIVE_ENDPOINTING,
     LATENCY_DEBUG,
+    TURN_TRACKER_ENABLED,
+    DETERMINISTIC_FAST_PATH_ENABLED,
+    TURN_SHORT_PAUSE_MS,
+    TURN_CONTINUATION_WAIT_MS,
+    TURN_LOW_CONFIDENCE_THRESHOLD,
+    LOOKUP_FILLER_DELAY_MS,
+    EXPECTED_SLOT_CONTINUATION_WAIT_MS,
+    EXPECTED_SLOT_WEAK_FRAGMENT_MAX_TOKENS,
+    EXPECTED_SLOT_ENABLE_DATE_TIME_FAST_PATH,
 )
 from models.state import PatientState, YES_PAT, NO_PAT
 from pipelines.pipeline_config import get_pipeline_components
@@ -97,9 +107,23 @@ from pipelines.urdu_prompt import URDU_SYSTEM_PROMPT
 from services.database_service import fetch_clinic_context_optimized
 from services.scheduling_service import load_schedule_from_settings, get_duration_for_service
 from services.extraction_service import extract_name_quick, extract_reason_quick
+from utils.turn_taking import (
+    CompletionLabel,
+    ExpectedUserSlot,
+    PolicyAction,
+    StreamingTurnTracker,
+    TurnTakingConfig,
+    build_policy_decision,
+    format_policy_log,
+    format_tracker_log,
+    preview_turn,
+    strip_duplicate_acknowledgement,
+)
 from utils.agent_flow import (
     has_date_reference,
     has_time_reference,
+    looks_like_delivery_follow_up_fragment,
+    normalize_patient_name,
     resolve_confirmation_intent,
     resolve_delivery_preference,
     store_detected_phone,
@@ -107,7 +131,7 @@ from utils.agent_flow import (
     user_declined_anything_else,
     user_said_goodbye,
 )
-from tools.assistant_tools import AssistantTools, update_global_clinic_info
+from tools.assistant_tools import AssistantTools, _delivery_question_text, update_global_clinic_info
 
 # =============================================================================
 # Per-turn latency instrumentation
@@ -181,7 +205,7 @@ class TurnTimer:
             parts.append(f"tool={tool_ms:.0f}ms")
 
         snippet = (user_text or "")[:60].replace("\n", " ")
-        logger.info(f"[TURN] {' | '.join(parts)} | user='{snippet}'")
+        logger.info(f"[TURN METRICS] {' | '.join(parts)} | user='{snippet}'")
 
 
 # Global turn timer — replaced per user utterance
@@ -210,7 +234,7 @@ WORKFLOW — 1 question at a time, 1-2 sentences max:
 4. Time -> call update_patient_record(time_suggestion="...") with natural language like "tomorrow at 2pm".
    - If slot is taken, the tool returns alternatives — offer them immediately.
    - If user says a month without a day (e.g. "February at 2pm") -> ask which day.
-5. After name+reason+time captured: ask "Can I use the number you're calling from?"
+5. After name+reason+time captured: ask "Can I use the number you're calling from for your appointment confirmation and reminders?"
    - "yes" / "sure" / similar -> call confirm_phone(confirmed=True) IMMEDIATELY. Do not ask again.
    - "no" or gives different number -> call update_patient_record(phone=...).
 6. All required fields captured -> call confirm_and_book_appointment IMMEDIATELY. Don't ask "shall I book?".
@@ -223,6 +247,9 @@ RULES:
 - Call update_patient_record IMMEDIATELY when you hear any info. Never wait.
 - Normalize spoken input before saving: "three one zero" -> "310", "at gmail dot com" -> "@gmail.com".
 - Once caller ID is confirmed, refer to it as "the number you're calling from", "this number", or "your number" — do not repeat the full digits unless the caller asks.
+- When asking to confirm caller ID, phrase it naturally around appointment confirmations, booking updates, or reminders.
+- CRITICAL PERSPECTIVE RULE: You are the AGENT. The CALLER is on the other end. NEVER say "I'm calling from" or "the number I'm calling from" — that is the caller's perspective. Always say "the number YOU'RE calling from" or "this number".
+- NEVER parrot back the caller's own phrasing when it creates a perspective inversion. If the caller says 'use the number I'm calling from', you respond 'Perfect, I'll use this number for your confirmation and reminders.'
 - Never say "booked" until the tool confirms it.
 - Never admit you are AI — say "I'm the office assistant."
 - Never offer callbacks (you cannot dial out).
@@ -269,13 +296,42 @@ def _normalize_phone_e164(raw: str, region: str = "PK") -> tuple[Optional[str], 
 # Clinic FAQ fetch (replaces RAG — one query at session start)
 # =============================================================================
 
-async def _fetch_clinic_faq(clinic_id: Optional[str]) -> str:
+def _normalize_knowledge_articles(rows: Any) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    if not isinstance(rows, list):
+        return normalized
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        title_value = row.get("title")
+        body_value = row.get("body")
+        title = title_value.strip() if isinstance(title_value, str) else ""
+        body = " ".join(body_value.split()) if isinstance(body_value, str) else ""
+        if title or body:
+            normalized.append({"title": title, "body": body})
+    return normalized
+
+
+def _format_clinic_faq(articles: list[dict[str, str]]) -> str:
+    if not articles:
+        return "No additional clinic information available."
+
+    lines: list[str] = []
+    for article in articles:
+        title = article.get("title", "").strip()
+        body = " ".join(article.get("body", "").split()[:50]).strip()
+        if title and body:
+            lines.append(f"- {title}: {body}")
+    return "\n".join(lines) if lines else "No additional clinic information available."
+
+
+async def _fetch_clinic_knowledge_articles(clinic_id: Optional[str]) -> list[dict[str, str]]:
     """
-    Fetch clinic FAQ articles in one query and return as a compact text block.
-    Injected into the system prompt — no tool call needed per question.
+    Fetch clinic knowledge articles once and keep them in memory for deterministic
+    answers to pricing, insurance, hours, parking, and other clinic questions.
     """
     if not clinic_id:
-        return "No additional clinic information available."
+        return []
     try:
         result = await asyncio.to_thread(
             lambda: supabase.table("knowledge_articles")
@@ -284,23 +340,18 @@ async def _fetch_clinic_faq(clinic_id: Optional[str]) -> str:
             .limit(20)
             .execute()
         )
-        raw_rows = result.data
-        if not isinstance(raw_rows, list) or not raw_rows:
-            return "No additional clinic information available."
-        lines: list[str] = []
-        for row in raw_rows:
-            if not isinstance(row, Mapping):
-                continue
-            title_value = row.get("title")
-            body_value = row.get("body")
-            title = title_value.strip() if isinstance(title_value, str) else ""
-            body = " ".join(body_value.split()[:50]) if isinstance(body_value, str) else ""  # cap at 50 words each
-            if title and body:
-                lines.append(f"- {title}: {body}")
-        return "\n".join(lines) if lines else "No additional clinic information available."
+        return _normalize_knowledge_articles(result.data)
     except Exception as e:
         logger.warning(f"[FAQ] Fetch failed: {e}")
-        return "No additional clinic information available."
+        return []
+
+
+async def _fetch_clinic_faq(clinic_id: Optional[str]) -> str:
+    """
+    Fetch clinic FAQ articles in one query and return as a compact text block.
+    Injected into the system prompt — no tool call needed per question.
+    """
+    return _format_clinic_faq(await _fetch_clinic_knowledge_articles(clinic_id))
 
 
 # =============================================================================
@@ -487,15 +538,37 @@ def _looks_like_capture_turn(text: str) -> bool:
 
 
 def _needs_filler(text: str, state: Optional[PatientState] = None) -> bool:
-    """Return True if a filler phrase should be sent for this user input.
+    """Preview whether policy would allow a filler for this utterance."""
+    if state is not None:
+        if getattr(state, "booking_in_progress", False):
+            return False
+        if getattr(state, "appointment_booked", False) or getattr(state, "booking_confirmed", False):
+            return False
+        if getattr(state, "pending_confirm_field", None) or getattr(state, "pending_confirm", None):
+            return False
+        if getattr(state, "delivery_preference_pending", False):
+            return False
+        if getattr(state, "anything_else_pending", False):
+            return False
 
-    Accepts optional state for context-aware suppression:
-    - Suppresses when booking is already in progress or done.
-    - Suppresses all pending confirmation turns so deterministic handling or direct
-      slot capture owns the turn.
-    """
-    ack, _ = _micro_ack_decision(text, state=state)
-    return ack is not None
+    snapshot, decision = preview_turn(
+        text,
+        patient_state=state or PatientState(),
+        silence_ms=TURN_SHORT_PAUSE_MS,
+        config=TurnTakingConfig(
+            short_pause_ms=TURN_SHORT_PAUSE_MS,
+            continuation_wait_ms=TURN_CONTINUATION_WAIT_MS,
+            low_confidence_threshold=TURN_LOW_CONFIDENCE_THRESHOLD,
+            deterministic_fast_path_enabled=DETERMINISTIC_FAST_PATH_ENABLED,
+            lookup_filler_delay_ms=LOOKUP_FILLER_DELAY_MS,
+            expected_slot_continuation_wait_ms=EXPECTED_SLOT_CONTINUATION_WAIT_MS,
+            expected_slot_weak_fragment_max_tokens=EXPECTED_SLOT_WEAK_FRAGMENT_MAX_TOKENS,
+            expected_slot_enable_date_time_fast_path=EXPECTED_SLOT_ENABLE_DATE_TIME_FAST_PATH,
+        ),
+    )
+    if snapshot.completion_label in {CompletionLabel.INCOMPLETE, CompletionLabel.LIKELY_CONTINUING}:
+        return False
+    return decision.filler_text is not None
 
 
 def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any]) -> list[str]:
@@ -507,9 +580,10 @@ def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any
 
     if not state.full_name:
         detected_name = extract_name_quick(recent_context)
-        if detected_name:
-            state.full_name = detected_name
-            updates.append(f"name={detected_name}")
+        normalized_name = normalize_patient_name(detected_name)
+        if normalized_name:
+            state.full_name = normalized_name
+            updates.append(f"name={normalized_name}")
 
     if not state.reason:
         detected_reason = extract_reason_quick(recent_context)
@@ -525,6 +599,10 @@ def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any
 
 
 def _build_missing_slot_prompt(state: PatientState) -> str:
+    if state.appointment_booked and state.delivery_preference_pending:
+        return _delivery_question_text(state)
+    if state.appointment_booked and state.anything_else_pending:
+        return "Is there anything else I can help you with today?"
     missing = [slot for slot in state.missing_slots() if slot != "phone_confirmed"]
     if "full_name" in missing and "reason" in missing:
         return "Perfect. What name should I put on the appointment, and what are you coming in for?"
@@ -543,9 +621,114 @@ def _build_missing_slot_prompt(state: PatientState) -> str:
     return "Perfect. Let me take care of that."
 
 
+def _build_no_repeat_llm_instruction(state: PatientState, latest_user_text: str) -> Optional[str]:
+    if not any([state.full_name, state.reason, state.dt_local, state.dt_text, state.appointment_booked]):
+        return None
+
+    guards: list[str] = [
+        "Do not greet, welcome, or introduce yourself again. Continue from the current call state.",
+    ]
+    if state.appointment_booked:
+        guards.append(
+            "The appointment is already booked. Do not ask for the caller's name, reason, phone number, or appointment time again."
+        )
+        guards.append(
+            "Do not say goodbye or imply the call is over unless the caller explicitly indicates they are done or says goodbye."
+        )
+        if state.delivery_preference_pending:
+            guards.append(
+                "Stay in the delivery-preference flow. Answer any brief side question, then ask exactly which delivery method they want for the confirmation."
+            )
+            guards.append(f"Return to this question after any brief answer: {_delivery_question_text(state)}")
+        elif state.anything_else_pending:
+            guards.append(
+                "Stay in the post-booking follow-up flow. Answer any brief question, then ask if there is anything else you can help with today."
+            )
+        else:
+            guards.append("Keep the booked context intact and do not restart intake.")
+    else:
+        if state.full_name:
+            guards.append(
+                f"The caller's name is already saved as {state.full_name}. Do not ask for their name again unless they explicitly correct it."
+            )
+        if state.reason:
+            guards.append(
+                f"The reason is already saved as {state.reason}. Do not ask for the reason again unless they explicitly change it."
+            )
+        if state.dt_local:
+            dt_spoken = state.dt_local.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")
+            guards.append(
+                f"The appointment time is already captured as {dt_spoken}. Do not restart booking intake."
+            )
+        elif state.dt_text:
+            guards.append(
+                f"There is already date/time context saved as '{state.dt_text}'. Do not restart intake or ask for broad booking details again."
+            )
+        guards.append(
+            f"If you need to move the booking forward, only ask the next missing piece: {_build_missing_slot_prompt(state)}"
+        )
+
+    if latest_user_text:
+        guards.append("If the caller asked a direct question, answer it briefly before asking for anything else.")
+    return " ".join(guards)
+
+
+def _infer_expected_slot_from_response(
+    *,
+    route: Optional[str],
+    spoken_text: str,
+    state: Optional[PatientState],
+) -> Optional[ExpectedUserSlot]:
+    normalized = (spoken_text or "").strip().lower()
+
+    if route in {"booking.ask_service", "booking.reask_service"}:
+        return ExpectedUserSlot.SERVICE
+    if route in {"booking.ask_date_time", "booking.reask_date_time"}:
+        return ExpectedUserSlot.DATE_TIME
+    if route in {"booking.ask_date", "booking.reask_date"}:
+        return ExpectedUserSlot.DATE
+    if route in {"booking.ask_time", "booking.reask_time"}:
+        return ExpectedUserSlot.TIME
+
+    if (
+        "can i use the number you're calling from" in normalized
+        or "is this the right number to send your confirmation to" in normalized
+        or bool(state and (state.pending_confirm == "phone" or state.pending_confirm_field == "phone"))
+    ):
+        return ExpectedUserSlot.PHONE_CONFIRMATION
+
+    if "what time works best" in normalized or "didn't catch the time" in normalized:
+        return ExpectedUserSlot.TIME
+    if "what day would you like" in normalized or "could you specify the day" in normalized:
+        return ExpectedUserSlot.DATE
+    if "what day and time would you like" in normalized:
+        return ExpectedUserSlot.DATE_TIME
+
+    if route == "booking.capture_date":
+        if state and state.dt_text and has_date_reference(state.dt_text) and not state.dt_local:
+            return ExpectedUserSlot.TIME
+        return ExpectedUserSlot.DATE_TIME
+
+    if route in {"booking.capture_time", "booking.capture_datetime"}:
+        if state and state.dt_local:
+            return None
+        if state and state.dt_text:
+            has_date = has_date_reference(state.dt_text)
+            has_time = has_time_reference(state.dt_text)
+            if has_date and not has_time:
+                return ExpectedUserSlot.TIME
+            if has_time and not has_date:
+                return ExpectedUserSlot.DATE
+        if route == "booking.capture_time":
+            return ExpectedUserSlot.TIME
+        return ExpectedUserSlot.DATE_TIME
+
+    return None
+
+
 def _caller_number_confirmation_message(state: PatientState) -> str:
     if state.using_caller_number or state.confirmed_contact_number_source == "caller_id":
-        return "Perfect, I'll use the number you're calling from."
+        return "Perfect, I'll use this number for your confirmation and reminders."
     return "Perfect, I've noted that down."
 
 
@@ -560,12 +743,86 @@ def _final_closing_text() -> str:
     return "Wonderful. You're all set — we'll see you then. Have a great day."
 
 
+def _non_booking_closing_text() -> str:
+    return "Thanks for calling. Have a great day."
+
+
+def _closing_text_for_state(state: PatientState) -> str:
+    if state.appointment_booked or state.booking_confirmed:
+        return _final_closing_text()
+    return _non_booking_closing_text()
+
+
+def _session_say(
+    session: AgentSession,
+    text: str,
+    *,
+    allow_interruptions: bool = True,
+    add_to_chat_ctx: bool = True,
+) -> Any:
+    say_fn = getattr(session, "say")
+    try:
+        return say_fn(
+            text,
+            allow_interruptions=allow_interruptions,
+            add_to_chat_ctx=add_to_chat_ctx,
+        )
+    except TypeError:
+        return say_fn(text, allow_interruptions=allow_interruptions)
+
+
+async def _handle_exit_intent_turn(
+    *,
+    text: str,
+    state: PatientState,
+    session: AgentSession,
+    safe_say: Optional[Callable[..., Any]] = None,
+    cancel_scheduled_filler: Callable[[], None],
+    interrupt_filler: Callable[..., None],
+    refresh_memory_async: Optional[Callable[[], Awaitable[None]]] = None,
+    mark_direct_response: Optional[Callable[[], None]] = None,
+    schedule_auto_disconnect: Optional[Callable[[Any], None]] = None,
+) -> Literal["none", "consumed"]:
+    normalized = " ".join((text or "").strip().lower().split())
+    if not normalized or not user_said_goodbye(normalized):
+        return "none"
+
+    if safe_say is None:
+        def safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
+            return _session_say(
+                session,
+                text,
+                allow_interruptions=allow_interruptions,
+            )
+
+    cancel_scheduled_filler()
+    interrupt_filler(force=True)
+    state.call_ended = True
+    state.anything_else_pending = False
+    state.delivery_preference_pending = False
+    state.user_declined_more_help = True
+    state.user_goodbye_detected = True
+    state.final_goodbye_sent = True
+    state.closing_state = "final_goodbye_sent"
+
+    if refresh_memory_async is not None:
+        await refresh_memory_async()
+    if mark_direct_response is not None:
+        mark_direct_response()
+
+    final_handle = safe_say(_closing_text_for_state(state))
+    if schedule_auto_disconnect is not None:
+        schedule_auto_disconnect(final_handle)
+    return "consumed"
+
+
 async def _handle_deterministic_confirmation_turn(
     *,
     text: str,
     state: PatientState,
     assistant_tools: AssistantTools,
     session: AgentSession,
+    safe_say: Optional[Callable[..., Any]] = None,
     cancel_scheduled_filler: Callable[[], None],
     interrupt_filler: Callable[..., None],
     refresh_memory_async: Optional[Callable[[], Awaitable[None]]] = None,
@@ -574,6 +831,14 @@ async def _handle_deterministic_confirmation_turn(
     normalized = " ".join((text or "").strip().lower().split())
     if not normalized:
         return "none"
+
+    if safe_say is None:
+        def safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
+            return _session_say(
+                session,
+                text,
+                allow_interruptions=allow_interruptions,
+            )
 
     pending = state.pending_confirm_field or state.pending_confirm
     if not pending:
@@ -605,6 +870,12 @@ async def _handle_deterministic_confirmation_turn(
     if pending == "phone" and state.contact_phase_started:
         t0 = time.perf_counter()
         await assistant_tools.confirm_phone(confirmed=confirm_intent)  # type: ignore[call-arg]
+        try:
+            if hasattr(session, "interrupt"):
+                session.interrupt()
+                logger.info("[CONFIRM] Interrupted parallel LLM speech after phone confirmation")
+        except Exception as _e:
+            logger.debug(f"[CONFIRM] Interrupt attempt: {_e}")
         if refresh_memory_async is not None:
             await refresh_memory_async()
 
@@ -617,9 +888,10 @@ async def _handle_deterministic_confirmation_turn(
                 mark_direct_response()
             elapsed = (time.perf_counter() - t0) * 1000
             logger.info(f"[CONFIRM] Fast-lane booking complete in {elapsed:.0f}ms")
-            if state.using_caller_number or state.confirmed_contact_number_source == "caller_id":
-                booking_result = f"{_caller_number_confirmation_message(state)} {booking_result}".strip()
-            session.say(booking_result, allow_interruptions=True)
+            # Do NOT prepend the caller-number confirmation message here.
+            # confirm_and_book_appointment() already returns the complete booking sentence
+            # including the delivery question. Prefixing it again creates a duplicate.
+            safe_say(booking_result)
             return "consumed"
 
         prompt = (
@@ -629,7 +901,7 @@ async def _handle_deterministic_confirmation_turn(
         )
         if mark_direct_response is not None:
             mark_direct_response()
-        session.say(prompt, allow_interruptions=True)
+        safe_say(prompt)
         return "consumed"
 
     if pending == "email" and not state.email_confirmed:
@@ -643,7 +915,7 @@ async def _handle_deterministic_confirmation_turn(
                 await refresh_memory_async()
             if mark_direct_response is not None:
                 mark_direct_response()
-            session.say(booking_result, allow_interruptions=True)
+            safe_say(booking_result)
             return "consumed"
 
         prompt = (
@@ -653,7 +925,7 @@ async def _handle_deterministic_confirmation_turn(
         )
         if mark_direct_response is not None:
             mark_direct_response()
-        session.say(prompt, allow_interruptions=True)
+        safe_say(prompt)
         return "consumed"
 
     state.turn_consumed = False
@@ -666,6 +938,7 @@ async def _handle_post_booking_turn(
     state: PatientState,
     assistant_tools: AssistantTools,
     session: AgentSession,
+    safe_say: Optional[Callable[..., Any]] = None,
     cancel_scheduled_filler: Callable[[], None],
     interrupt_filler: Callable[..., None],
     refresh_memory_async: Optional[Callable[[], Awaitable[None]]] = None,
@@ -676,6 +949,14 @@ async def _handle_post_booking_turn(
     normalized = " ".join((text or "").strip().lower().split())
     if not normalized or not state.appointment_booked:
         return "none"
+
+    if safe_say is None:
+        def safe_say(text: str, *, allow_interruptions: bool = True) -> Any:
+            return _session_say(
+                session,
+                text,
+                allow_interruptions=allow_interruptions,
+            )
 
     if state.final_goodbye_sent:
         if user_said_goodbye(normalized) or user_declined_anything_else(normalized):
@@ -700,7 +981,40 @@ async def _handle_post_booking_turn(
     if state.delivery_preference_pending:
         preference = resolve_delivery_preference(normalized)
         if preference is None:
-            return "none"
+            if assistant_tools.can_answer_clinic_question(text):
+                cancel_scheduled_filler()
+                interrupt_filler(force=True)
+                if mark_direct_response is not None:
+                    mark_direct_response()
+                answer = await assistant_tools.search_clinic_info(question=text)
+                answer = str(answer or "").strip()
+                if answer:
+                    state.anything_else_pending = False
+                    state.user_declined_more_help = False
+                    state.final_goodbye_sent = False
+                    state.user_goodbye_detected = False
+                    state.closing_state = "delivery_pending"
+                    if refresh_memory_async is not None:
+                        await refresh_memory_async()
+                    safe_say(f"{answer} {_delivery_question_text(state)}")
+                    return "consumed"
+            state.delivery_ask_count = getattr(state, "delivery_ask_count", 0) + 1
+            if state.delivery_ask_count >= 3:
+                logger.info("[DELIVERY] Max retries reached — defaulting to WhatsApp")
+                preference = "whatsapp"
+            elif looks_like_delivery_follow_up_fragment(normalized):
+                cancel_scheduled_filler()
+                interrupt_filler(force=True)
+                if mark_direct_response is not None:
+                    mark_direct_response()
+                if refresh_memory_async is not None:
+                    await refresh_memory_async()
+                safe_say(_delivery_question_text(state))
+                return "consumed"
+            else:
+                return "none"
+        else:
+            state.delivery_ask_count = 0
         cancel_scheduled_filler()
         interrupt_filler(force=True)
         if mark_direct_response is not None:
@@ -708,8 +1022,23 @@ async def _handle_post_booking_turn(
         acknowledgement = await assistant_tools.set_delivery_preference(channel=preference)  # type: ignore[call-arg]
         if refresh_memory_async is not None:
             await refresh_memory_async()
-        session.say(acknowledgement, allow_interruptions=True)
+        safe_say(acknowledgement)
         return "consumed"
+
+    if assistant_tools.can_answer_clinic_question(text):
+        cancel_scheduled_filler()
+        interrupt_filler(force=True)
+        if mark_direct_response is not None:
+            mark_direct_response()
+        answer = await assistant_tools.answer_clinic_question(
+            text,
+            include_follow_up=True,
+        )
+        if answer:
+            if refresh_memory_async is not None:
+                await refresh_memory_async()
+            safe_say(answer)
+            return "consumed"
 
     if state.anything_else_pending:
         if user_declined_anything_else(normalized) or user_said_goodbye(normalized):
@@ -724,7 +1053,7 @@ async def _handle_post_booking_turn(
             logger.info("closing_state_entered")
             if mark_direct_response is not None:
                 mark_direct_response()
-            final_handle = session.say(_final_closing_text(), allow_interruptions=True)
+            final_handle = safe_say(_final_closing_text())
             state.final_goodbye_sent = True
             state.closing_state = "final_goodbye_sent"
             logger.info("final_goodbye_sent")
@@ -775,6 +1104,81 @@ async def entrypoint(ctx: JobContext):
     # ── State ─────────────────────────────────────────────────────────────────
     state = PatientState()
     disconnect_event = asyncio.Event()
+    turn_config = TurnTakingConfig(
+        short_pause_ms=TURN_SHORT_PAUSE_MS,
+        continuation_wait_ms=TURN_CONTINUATION_WAIT_MS,
+        low_confidence_threshold=TURN_LOW_CONFIDENCE_THRESHOLD,
+        deterministic_fast_path_enabled=DETERMINISTIC_FAST_PATH_ENABLED,
+        lookup_filler_delay_ms=LOOKUP_FILLER_DELAY_MS,
+        expected_slot_continuation_wait_ms=EXPECTED_SLOT_CONTINUATION_WAIT_MS,
+        expected_slot_weak_fragment_max_tokens=EXPECTED_SLOT_WEAK_FRAGMENT_MAX_TOKENS,
+        expected_slot_enable_date_time_fast_path=EXPECTED_SLOT_ENABLE_DATE_TIME_FAST_PATH,
+    )
+    turn_tracker = StreamingTurnTracker(turn_config)
+    _turn_runtime: Dict[str, Any] = {
+        "last_user_listening_started_at": None,
+        "continuation_task": None,
+        "planned_filler_text": None,
+        "last_policy_decision": None,
+    }
+
+    def _set_expected_slot(slot: Optional[str | ExpectedUserSlot], *, reason: str) -> None:
+        if not TURN_TRACKER_ENABLED:
+            return
+        previous = turn_tracker.expected_user_slot or "-"
+        if slot is None:
+            turn_tracker.clear_expected_user_slot()
+            logger.info(f"[EXPECTED SLOT] cleared previous={previous} reason={reason}")
+            return
+        resolved = slot.value if isinstance(slot, ExpectedUserSlot) else str(slot)
+        turn_tracker.set_expected_user_slot(resolved)
+        logger.info(f"[EXPECTED SLOT] set={resolved} previous={previous} reason={reason}")
+
+    def _apply_expected_slot_from_output(*, route: Optional[str], spoken_text: str) -> None:
+        next_slot = _infer_expected_slot_from_response(
+            route=route,
+            spoken_text=spoken_text,
+            state=state,
+        )
+        _set_expected_slot(
+            next_slot,
+            reason=route or ("prompt_text" if next_slot is not None else "response_complete"),
+        )
+
+    def _is_session_alive() -> bool:
+        """Return False after disconnect has been signalled."""
+        return not disconnect_event.is_set()
+
+    def _safe_say(text: str, *, allow_interruptions: bool = True, add_to_chat_ctx: bool = True):
+        """Speech wrapper that silently no-ops after disconnect."""
+        if not _is_session_alive():
+            logger.debug(f"[SAFE_SAY] Suppressed post-disconnect say: '{text[:40]}'")
+            return None
+        try:
+            return _session_say(
+                session,
+                text,
+                allow_interruptions=allow_interruptions,
+                add_to_chat_ctx=add_to_chat_ctx,
+            )
+        except Exception as e:
+            logger.debug(f"[SAFE_SAY] session.say failed: {e}")
+            return None
+
+    def _cancel_pending_continuation(reason: str) -> None:
+        task = _turn_runtime.get("continuation_task")
+        if task and not task.done():
+            task.cancel()
+            logger.info(f"[RESPONSE POLICY] cancelled_pending_continuation reason={reason}")
+        _turn_runtime["continuation_task"] = None
+
+    def _log_turn_snapshot() -> None:
+        logger.info(f"[TURN TRACKER] {format_tracker_log(turn_tracker.snapshot)}")
+        logger.info(
+            "[COMPLETION CLASSIFIER] "
+            f"label={turn_tracker.snapshot.completion_label.value} "
+            f"reasons={turn_tracker.snapshot.completion_reasons}"
+        )
 
     # ── SIP phone extraction ──────────────────────────────────────────────────
     called_num: Optional[str] = None
@@ -845,7 +1249,7 @@ async def entrypoint(ctx: JobContext):
     clinic_tz = (clinic_info or {}).get("timezone") or clinic_tz
     clinic_region = (clinic_info or {}).get("default_phone_region") or clinic_region
     agent_lang = (agent_info or {}).get("default_language") or agent_lang
-    state.tz = clinic_tz
+    state.tz = BOOKING_TZ
 
     # Re-normalize caller ID once the clinic region is known to handle local formats.
     if caller_phone:
@@ -856,27 +1260,26 @@ async def entrypoint(ctx: JobContext):
 
     # Push globals for tools
     update_global_clinic_info(clinic_info, settings or {})
+    logger.info(f"[TZ] Booking timezone locked to: {BOOKING_TZ} (clinic field='{clinic_tz}' ignored for datetime math)")
 
-    from tools.assistant_tools import _GLOBAL_SCHEDULE
     schedule = load_schedule_from_settings(settings or {})
     import tools.assistant_tools as _tools_mod
-    _tools_mod._GLOBAL_SCHEDULE = schedule
-    _tools_mod._GLOBAL_CLINIC_TZ = clinic_tz
 
     # Fetch clinic FAQ (replaces RAG — one query, injected into prompt)
-    clinic_faq = await _fetch_clinic_faq((clinic_info or {}).get("id"))
+    clinic_knowledge_articles = await _fetch_clinic_knowledge_articles((clinic_info or {}).get("id"))
+    clinic_faq = _format_clinic_faq(clinic_knowledge_articles)
 
     # ── System prompt builder ─────────────────────────────────────────────────
     _active_pipeline = os.getenv("ACTIVE_PIPELINE", "english").strip().lower()
     _is_urdu = _active_pipeline == "urdu"
 
     def get_updated_instructions() -> str:
-        now = datetime.now(ZoneInfo(clinic_tz))
+        now = datetime.now(ZoneInfo(BOOKING_TZ))
         template = URDU_SYSTEM_PROMPT if _is_urdu else SYSTEM_PROMPT
         return template.format(
             agent_name=agent_name,
             clinic_name=clinic_name,
-            timezone=clinic_tz,
+            timezone=BOOKING_TZ,
             current_date=now.strftime("%A, %B %d, %Y"),
             current_time=now.strftime("%I:%M %p"),
             state_summary=state.detailed_state_for_prompt(),
@@ -901,7 +1304,14 @@ async def entrypoint(ctx: JobContext):
     )
 
     # ── Tools ─────────────────────────────────────────────────────────────────
-    assistant_tools = AssistantTools(state)
+    assistant_tools = AssistantTools(
+        state=state,
+        clinic_info=clinic_info or {},
+        settings=settings or {},
+        schedule=schedule,
+        clinic_tz=clinic_tz,
+        knowledge_articles=clinic_knowledge_articles,
+    )
     function_tools = llm.find_function_tools(assistant_tools)
     _session_refs: Dict[str, Any] = {"session": None, "agent": None}
 
@@ -923,6 +1333,237 @@ async def entrypoint(ctx: JobContext):
     def refresh_agent_memory() -> None:
         asyncio.create_task(refresh_agent_memory_async())
 
+    async def _run_lookup_with_bridge(
+        decision: Any,
+        *,
+        mark_direct_response: Optional[Callable[[], None]] = None,
+    ) -> None:
+        lookup_tool = getattr(assistant_tools, str(decision.lookup_tool or ""), None)
+        if lookup_tool is None:
+            logger.warning(f"[FAST PATH] Missing lookup tool: {decision.lookup_tool}")
+            return
+
+        lookup_task = asyncio.create_task(lookup_tool())  # type: ignore[misc]
+        result_text: Optional[str] = None
+
+        try:
+            if decision.filler_text and not turn_tracker.snapshot.filler_spoken_for_turn:
+                try:
+                    result_text = await asyncio.wait_for(
+                        asyncio.shield(lookup_task),
+                        timeout=max(1, turn_config.lookup_filler_delay_ms) / 1000.0,
+                    )
+                except asyncio.TimeoutError:
+                    bridge_text = str(decision.filler_text)
+                    _filler_state["reason"] = "lookup_bridge"
+                    asyncio.create_task(_send_filler(bridge_text))
+                    logger.info(f"[FILLER] queued contextual_bridge='{bridge_text}'")
+
+            if result_text is None:
+                result_text = await lookup_task
+
+            spoken_text = str(result_text or "").strip()
+            if turn_tracker.snapshot.filler_spoken_for_turn:
+                spoken_text = strip_duplicate_acknowledgement(spoken_text)
+
+            if not spoken_text:
+                return
+
+            if mark_direct_response is not None:
+                mark_direct_response()
+            turn_tracker.mark_main_response_started()
+            logger.info(
+                f"[FAST PATH] lookup_complete route={decision.deterministic_route} "
+                f"text='{spoken_text[:120]}'"
+            )
+            _safe_say(spoken_text)
+        except Exception as exc:
+            logger.warning(f"[FAST PATH] lookup flow failed: {exc}")
+            await session.generate_reply(
+                instructions=(
+                    "The backend lookup was unavailable. Apologize briefly and ask for the "
+                    "appointment phone number or name again if needed."
+                )
+            )
+
+    async def _execute_policy_decision(
+        decision: Any,
+        *,
+        after_continuation_wait: bool = False,
+        mark_direct_response: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        _turn_runtime["last_policy_decision"] = decision
+        _turn_runtime["planned_filler_text"] = decision.filler_text
+        logger.info(f"[RESPONSE POLICY] {format_policy_log(decision)}")
+
+        if decision.action == PolicyAction.WAIT:
+            _turn_runtime["planned_filler_text"] = None
+            turn_tracker.mark_waiting_for_continuation(True)
+            _cancel_scheduled_filler()
+            if turn_tracker.snapshot.expected_user_slot and turn_tracker.snapshot.expected_slot_status == "unsatisfied":
+                logger.info(
+                    f"[EXPECTED SLOT] unsatisfied wait_for_continuation "
+                    f"slot={turn_tracker.snapshot.expected_user_slot} "
+                    f"text='{(turn_tracker.snapshot.current_turn_accumulated_text or turn_tracker.snapshot.latest_finalized_text)[:120]}'"
+                )
+
+            async def _resume_after_wait(turn_id: int) -> None:
+                try:
+                    await asyncio.sleep(max(1, decision.wait_ms) / 1000.0)
+                    if turn_tracker.snapshot.logical_turn_id != turn_id:
+                        return
+                    if turn_tracker.snapshot.main_response_started:
+                        return
+                    turn_tracker.mark_waiting_for_continuation(False)
+                    replay_text = (
+                        turn_tracker.snapshot.current_turn_accumulated_text
+                        or turn_tracker.snapshot.latest_finalized_text
+                    )
+                    if not replay_text:
+                        return
+                    turn_tracker.ingest_transcript(
+                        replay_text,
+                        is_final=True,
+                        patient_state=state,
+                        silence_ms=max(
+                            turn_tracker.snapshot.silence_ms or 0,
+                            turn_config.short_pause_ms,
+                        )
+                        + max(1, decision.wait_ms),
+                    )
+                    _log_turn_snapshot()
+                    resumed = build_policy_decision(
+                        turn_tracker.snapshot,
+                        state,
+                        turn_config,
+                        after_continuation_wait=True,
+                    )
+                    await _execute_policy_decision(
+                        resumed,
+                        after_continuation_wait=True,
+                        mark_direct_response=mark_direct_response,
+                    )
+                except asyncio.CancelledError:
+                    return
+
+            _cancel_pending_continuation("reschedule_wait")
+            _turn_runtime["continuation_task"] = asyncio.create_task(
+                _resume_after_wait(turn_tracker.snapshot.logical_turn_id)
+            )
+            return True
+
+        _cancel_pending_continuation("decision_resolved")
+        turn_tracker.mark_waiting_for_continuation(False)
+
+        if decision.action == PolicyAction.FAST_PATH:
+            _turn_runtime["planned_filler_text"] = None
+            _cancel_scheduled_filler()
+            _interrupt_filler(force=True)
+            route = str(decision.deterministic_route or "")
+
+            if route in {"booking.capture_datetime", "booking.capture_date", "booking.capture_time"}:
+                capture_text = (
+                    turn_tracker.snapshot.current_turn_accumulated_text
+                    or turn_tracker.snapshot.latest_finalized_text
+                ).strip()
+                logger.info(
+                    f"[EXPECTED SLOT] satisfied={turn_tracker.snapshot.expected_user_slot or '-'} "
+                    f"status={turn_tracker.snapshot.expected_slot_status or '-'} "
+                    f"text='{capture_text[:120]}'"
+                )
+                logger.info(
+                    f"[FAST PATH] route={route} text='{capture_text[:120]}' "
+                    f"expected_slot={turn_tracker.snapshot.expected_user_slot or '-'}"
+                )
+                spoken_text = await assistant_tools.update_patient_record(  # type: ignore[call-arg]
+                    time_suggestion=capture_text
+                )
+                spoken_text = str(spoken_text or "").strip()
+                if turn_tracker.snapshot.filler_spoken_for_turn:
+                    spoken_text = strip_duplicate_acknowledgement(spoken_text)
+                _apply_expected_slot_from_output(route=route, spoken_text=spoken_text)
+                if mark_direct_response is not None:
+                    mark_direct_response()
+                turn_tracker.mark_main_response_started()
+                if spoken_text:
+                    _safe_say(spoken_text)
+                return True
+
+            if route == "clinic_info.answer":
+                question_text = (
+                    turn_tracker.snapshot.current_turn_accumulated_text
+                    or turn_tracker.snapshot.latest_finalized_text
+                ).strip()
+                logger.info(
+                    f"[FAST PATH] route={route} text='{question_text[:120]}' "
+                    f"booked={state.appointment_booked}"
+                )
+                spoken_text = await assistant_tools.answer_clinic_question(
+                    question_text,
+                    include_follow_up=bool(
+                        state.appointment_booked and not state.delivery_preference_pending
+                    ),
+                )
+                spoken_text = str(spoken_text or "").strip()
+                if turn_tracker.snapshot.filler_spoken_for_turn:
+                    spoken_text = strip_duplicate_acknowledgement(spoken_text)
+                _apply_expected_slot_from_output(route=route, spoken_text=spoken_text)
+                if mark_direct_response is not None:
+                    mark_direct_response()
+                turn_tracker.mark_main_response_started()
+                if spoken_text:
+                    _safe_say(spoken_text)
+                return True
+
+            if mark_direct_response is not None:
+                mark_direct_response()
+            turn_tracker.mark_main_response_started()
+            spoken_text = str(decision.response_text or "").strip()
+            if turn_tracker.snapshot.filler_spoken_for_turn:
+                spoken_text = strip_duplicate_acknowledgement(spoken_text)
+            logger.info(
+                f"[FAST PATH] route={route or '-'} "
+                f"text='{spoken_text[:120]}'"
+            )
+            if spoken_text:
+                _apply_expected_slot_from_output(route=route, spoken_text=spoken_text)
+                _safe_say(spoken_text)
+            return True
+
+        if decision.action == PolicyAction.LOOKUP:
+            _turn_runtime["planned_filler_text"] = None
+            _cancel_scheduled_filler()
+            _interrupt_filler(force=True)
+            await _run_lookup_with_bridge(
+                decision,
+                mark_direct_response=mark_direct_response,
+            )
+            return True
+
+        if decision.action == PolicyAction.LLM and decision.llm_instruction:
+            _turn_runtime["planned_filler_text"] = None
+            logger.info(
+                f"[LLM PATH] mode=custom_instruction reasons={decision.reasons} "
+                f"filler_spoken={turn_tracker.snapshot.filler_spoken_for_turn}"
+            )
+            await session.generate_reply(instructions=decision.llm_instruction)
+            return True
+
+        logger.info(
+            f"[LLM PATH] mode=default reasons={decision.reasons} "
+            f"filler={decision.filler_text or '-'}"
+        )
+        guarded_instruction = _build_no_repeat_llm_instruction(
+            state,
+            state.last_user_text or "",
+        )
+        if guarded_instruction:
+            _turn_runtime["planned_filler_text"] = None
+            logger.info("[LLM PATH] mode=guarded_stateful_fallback")
+            await session.generate_reply(instructions=guarded_instruction)
+            return True
+        return False
+
     class ReceptionAgent(Agent):
         async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
             text = (new_message.text_content or "").strip()
@@ -940,12 +1581,18 @@ async def entrypoint(ctx: JobContext):
                 state=state,
                 assistant_tools=assistant_tools,
                 session=session,
+                safe_say=_safe_say,
                 cancel_scheduled_filler=_cancel_scheduled_filler,
                 interrupt_filler=_interrupt_filler,
                 refresh_memory_async=refresh_agent_memory_async,
                 mark_direct_response=_mark_direct_response,
             )
             if result == "consumed":
+                if TURN_TRACKER_ENABLED:
+                    if state.pending_confirm == "phone" or state.pending_confirm_field == "phone":
+                        _set_expected_slot(ExpectedUserSlot.PHONE_CONFIRMATION, reason="phone_confirmation_pending")
+                    else:
+                        _set_expected_slot(None, reason="confirmation_turn_consumed")
                 raise llm.StopResponse()
 
             result = await _handle_post_booking_turn(
@@ -953,6 +1600,7 @@ async def entrypoint(ctx: JobContext):
                 state=state,
                 assistant_tools=assistant_tools,
                 session=session,
+                safe_say=_safe_say,
                 cancel_scheduled_filler=_cancel_scheduled_filler,
                 interrupt_filler=_interrupt_filler,
                 refresh_memory_async=refresh_agent_memory_async,
@@ -961,7 +1609,47 @@ async def entrypoint(ctx: JobContext):
                 cancel_auto_disconnect=_cancel_auto_disconnect,
             )
             if result == "consumed":
+                if TURN_TRACKER_ENABLED:
+                    _set_expected_slot(None, reason="post_booking_turn_consumed")
                 raise llm.StopResponse()
+
+            result = await _handle_exit_intent_turn(
+                text=text,
+                state=state,
+                session=session,
+                safe_say=_safe_say,
+                cancel_scheduled_filler=_cancel_scheduled_filler,
+                interrupt_filler=_interrupt_filler,
+                refresh_memory_async=refresh_agent_memory_async,
+                mark_direct_response=_mark_direct_response,
+                schedule_auto_disconnect=_schedule_auto_disconnect,
+            )
+            if result == "consumed":
+                if TURN_TRACKER_ENABLED:
+                    _set_expected_slot(None, reason="exit_intent_turn_consumed")
+                raise llm.StopResponse()
+
+            if TURN_TRACKER_ENABLED:
+                if not turn_tracker.snapshot.latest_finalized_text and text:
+                    turn_tracker.ingest_transcript(
+                        text,
+                        is_final=True,
+                        patient_state=state,
+                        silence_ms=turn_tracker.snapshot.silence_ms,
+                    )
+                    _log_turn_snapshot()
+
+                decision = build_policy_decision(
+                    turn_tracker.snapshot,
+                    state,
+                    turn_config,
+                )
+                handled = await _execute_policy_decision(
+                    decision,
+                    mark_direct_response=_mark_direct_response,
+                )
+                if handled:
+                    raise llm.StopResponse()
 
     # ── AgentSession + Agent ──────────────────────────────────────────────────
     # NOTE: MIN/MAX_ENDPOINTING_DELAY were previously imported from config but
@@ -1004,7 +1692,7 @@ async def entrypoint(ctx: JobContext):
             _current_turn.mark("direct_say")
         sess = _session_refs.get("session")
         if sess:
-            sess.say(text)
+            _safe_say(text)
             logger.info(f"[DIRECT_SAY] '{text[:80]}'")
 
     # Inject refresh callback into tools module
@@ -1096,6 +1784,8 @@ async def entrypoint(ctx: JobContext):
         _closing_runtime["auto_disconnect_task"] = asyncio.create_task(_runner())
 
     # ── Metrics (2 lines, not 40) ─────────────────────────────────────────────
+    assistant_tools._schedule_auto_disconnect = _schedule_auto_disconnect
+
     def _on_metrics(ev: MetricsCollectedEvent):
         lk_metrics.log_metrics(ev.metrics)
     session.on("metrics_collected", _on_metrics)
@@ -1158,11 +1848,7 @@ async def entrypoint(ctx: JobContext):
         handle = None
         try:
             # Fillers should never block the user or enter the LLM chat context.
-            try:
-                handle = session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
-            except TypeError:
-                # Older SDK versions may not accept add_to_chat_ctx — fall back gracefully.
-                handle = session.say(text, allow_interruptions=True)
+            handle = _safe_say(text, add_to_chat_ctx=False)
             _filler_state["handle"] = handle
             _filler_state["active"] = True
             _filler_state["sent_at"] = _t0
@@ -1192,7 +1878,7 @@ async def entrypoint(ctx: JobContext):
         finally:
             _clear_filler_state(handle)
 
-    async def _schedule_filler():
+    async def _schedule_filler(planned_text: str):
         task = asyncio.current_task()
         try:
             await asyncio.sleep(filler_debounce_ms / 1000.0)
@@ -1200,8 +1886,7 @@ async def entrypoint(ctx: JobContext):
                 return
             if _filler_state.get("active"):
                 return
-            last_text = state.last_user_text or ""
-            filler, _ = _micro_ack_decision(last_text, state=state)
+            filler = (planned_text or "").strip()
             if not filler:
                 return
             await _send_filler(filler)
@@ -1213,12 +1898,30 @@ async def entrypoint(ctx: JobContext):
     # ── Pattern A: user_input_transcribed — send filler ───────────────────────
     def _on_user_transcribed(ev):
         global _current_turn
-        if not getattr(ev, "is_final", True):
-            return
         text = (getattr(ev, "transcript", "") or getattr(ev, "text", "") or "").strip()
         if not text:
             return
-        # Log user input
+        is_final = bool(getattr(ev, "is_final", True))
+
+        if TURN_TRACKER_ENABLED:
+            if turn_tracker.snapshot.logical_turn_id == 0 or turn_tracker.snapshot.main_response_started:
+                turn_tracker.start_new_turn()
+            silence_started = _turn_runtime.get("last_user_listening_started_at")
+            silence_ms = None
+            if is_final and silence_started:
+                silence_ms = max(0, int((time.perf_counter() - silence_started) * 1000))
+            turn_tracker.ingest_transcript(
+                text,
+                is_final=is_final,
+                patient_state=state,
+                silence_ms=silence_ms,
+            )
+            if is_final:
+                _log_turn_snapshot()
+
+        if not is_final:
+            return
+
         logger.info(f"[USER] {text}")
         state.remember_user_text(text)
         _cancel_scheduled_filler()
@@ -1233,6 +1936,7 @@ async def entrypoint(ctx: JobContext):
         # Start a new per-turn timer
         _current_turn = TurnTimer()
         _current_turn.mark("user_eou")
+        _current_turn.mark("stt_final")
 
         # NOTE: refresh_agent_memory() is intentionally NOT called here.
         # It was previously called on every utterance even when no state changed,
@@ -1242,12 +1946,45 @@ async def entrypoint(ctx: JobContext):
         # Reset turn ownership for this utterance before any deterministic routing.
         state.turn_consumed = False
 
+        if TURN_TRACKER_ENABLED:
+            decision = build_policy_decision(
+                turn_tracker.snapshot,
+                state,
+                turn_config,
+            )
+            _turn_runtime["last_policy_decision"] = decision
+            _turn_runtime["planned_filler_text"] = decision.filler_text
+
+            if decision.action == PolicyAction.WAIT:
+                logger.info(
+                    f"[FILLER] suppressed completion={turn_tracker.snapshot.completion_label.value} "
+                    f"reasons={turn_tracker.snapshot.completion_reasons}"
+                )
+                return
+
+            if not FILLER_ENABLED or _filler_state["active"]:
+                return
+
+            if decision.filler_text:
+                _filler_state["reason"] = "policy_filler"
+                _filler_state["scheduled_task"] = asyncio.create_task(
+                    _schedule_filler(str(decision.filler_text))
+                )
+                logger.info(
+                    f"[FILLER] scheduled text='{decision.filler_text}' "
+                    f"reasons={decision.reasons}"
+                )
+                return
+
+            logger.info("[FILLER] suppressed_no_helpful_bridge")
+            return
+
         if not FILLER_ENABLED or _filler_state["active"]:
             return
         filler_text, suppress_reason = _micro_ack_decision(text, state=state)
         if filler_text:
             _filler_state["reason"] = "micro_ack"
-            _filler_state["scheduled_task"] = asyncio.create_task(_schedule_filler())
+            _filler_state["scheduled_task"] = asyncio.create_task(_schedule_filler(filler_text))
             return
         if suppress_reason == "capture_turn":
             logger.info("micro_ack_suppressed_capture_turn")
@@ -1259,10 +1996,17 @@ async def entrypoint(ctx: JobContext):
     session.on("user_input_transcribed", _on_user_transcribed)
 
     def _on_user_state_changed(ev):
-        if getattr(ev, "new_state", None) != "speaking":
+        new_state = getattr(ev, "new_state", None)
+        if new_state == "listening":
+            _turn_runtime["last_user_listening_started_at"] = time.perf_counter()
+            return
+        if new_state != "speaking":
             return
         if state.final_goodbye_sent:
             _cancel_auto_disconnect()
+        if TURN_TRACKER_ENABLED and turn_tracker.snapshot.awaiting_continuation:
+            logger.info("[RESPONSE POLICY] user_resumed_before_continuation_timeout")
+        _cancel_pending_continuation("user_resumed_speaking")
         _cancel_scheduled_filler()
         _interrupt_filler(force=True)
 
@@ -1278,16 +2022,20 @@ async def entrypoint(ctx: JobContext):
         if current_handle is _filler_state.get("handle"):
             if _current_turn:
                 _current_turn.mark("filler_sent")
-            logger.info("micro_ack_sent")
+            if TURN_TRACKER_ENABLED:
+                turn_tracker.mark_filler_spoken(_filler_state.get("text"))
+            logger.info(f"[FILLER] spoken text='{_filler_state.get('text', '')}'")
             return
 
         scheduled_task = _filler_state.get("scheduled_task")
         if scheduled_task and not scheduled_task.done() and not _filler_state["active"]:
-            logger.info("micro_ack_suppressed_fast_main_reply")
+            logger.info("[FILLER] suppressed_fast_main_reply")
         _cancel_scheduled_filler()
         if _filler_state["active"]:
-            logger.info("micro_ack_cancelled_main_reply_ready")
+            logger.info("[FILLER] cancelled_main_reply_ready")
             _interrupt_filler(force=True)
+        if TURN_TRACKER_ENABLED:
+            turn_tracker.mark_main_response_started()
         if _current_turn:
             _current_turn.mark("speech_started")
             _current_turn.log_summary(state.last_user_text or "")
@@ -1299,17 +2047,62 @@ async def entrypoint(ctx: JobContext):
         text = getattr(item, "text_content", None)
         if isinstance(text, str) and text.strip():
             spoken = text.strip()
-            logger.info(f"[AGENT SAID] '{spoken}'")
             lower = spoken.lower()
+
+            # Perspective inversion guard
+            inversion_patterns = [
+                "i'm calling from",
+                "i am calling from",
+                "the number i'm calling",
+                "the number i am calling",
+                "number i'm calling from",
+                "number i am calling from",
+            ]
+            if any(pattern in lower for pattern in inversion_patterns):
+                logger.warning(f"[AGENT] Perspective inversion detected in: '{spoken[:80]}'")
+                corrected = spoken
+                for bad, good in [
+                    ("the number i'm calling from", "the number you're calling from"),
+                    ("the number i am calling from", "the number you're calling from"),
+                    ("number i'm calling from", "number you're calling from"),
+                    ("number i am calling from", "number you're calling from"),
+                    ("i'm calling from", "you're calling from"),
+                    ("i am calling from", "you are calling from"),
+                ]:
+                    corrected = corrected.replace(bad, good).replace(
+                        bad.replace("i'm", "I'm").replace("i am", "I am"),
+                        good.replace("you're", "You're").replace("you are", "You are"),
+                    )
+                if corrected != spoken:
+                    logger.info(f"[AGENT] Auto-corrected to: '{corrected[:80]}'")
+                    try:
+                        if hasattr(session, "interrupt"):
+                            session.interrupt()
+                        _safe_say(corrected)
+                        return
+                    except Exception as e:
+                        logger.warning(f"[AGENT] Correction injection failed: {e}")
+
+            logger.info(f"[AGENT SAID] '{spoken}'")
+            if TURN_TRACKER_ENABLED:
+                _apply_expected_slot_from_output(route=None, spoken_text=spoken)
             if state.appointment_booked and "whatsapp" in lower and "sms" in lower:
-                state.delivery_preference_pending = True
-                state.delivery_preference_asked = True
-                state.anything_else_pending = False
-                state.closing_state = "delivery_pending"
+                if not state.delivery_preference_pending:
+                    state.delivery_preference_pending = True
+                    state.delivery_preference_asked = True
+                    state.anything_else_pending = False
+                    state.closing_state = "delivery_pending"
+                    logger.debug("[STATE] delivery_preference_pending set to True (first occurrence)")
+                else:
+                    logger.debug("[STATE] delivery_preference_pending already True — skipping re-set on rephrase")
             if "anything else i can help" in lower:
-                state.anything_else_pending = True
-                state.anything_else_asked = True
-                state.closing_state = "anything_else_pending"
+                if not state.anything_else_pending:
+                    state.anything_else_pending = True
+                    state.anything_else_asked = True
+                    state.closing_state = "anything_else_pending"
+                    logger.debug("[STATE] anything_else_pending set to True (first occurrence)")
+                else:
+                    logger.debug("[STATE] anything_else_pending already True — skipping re-set")
             if _current_turn:
                 _current_turn.mark("speech_committed")
 
@@ -1340,12 +2133,28 @@ async def entrypoint(ctx: JobContext):
             )
             if late_called:
                 async def _refresh_ctx():
+                    nonlocal clinic_info, agent_info, settings, agent_name, clinic_name, clinic_tz, clinic_region, schedule, clinic_faq, clinic_knowledge_articles
                     try:
                         ci, ai, st, an = await fetch_clinic_context_optimized(late_called)
                         if ci:
+                            clinic_info = ci
+                            agent_info = ai
+                            settings = st
+                            agent_name = an
+                            clinic_name = ci.get("name") or clinic_name
+                            clinic_tz = ci.get("timezone") or clinic_tz
+                            clinic_region = ci.get("default_phone_region") or clinic_region
+                            schedule = load_schedule_from_settings(st or {})
                             update_global_clinic_info(ci, st or {})
-                            _tools_mod._GLOBAL_SCHEDULE = load_schedule_from_settings(st or {})
-                            _tools_mod._GLOBAL_CLINIC_TZ = ci.get("timezone", clinic_tz)
+                            clinic_knowledge_articles = await _fetch_clinic_knowledge_articles(ci.get("id"))
+                            clinic_faq = _format_clinic_faq(clinic_knowledge_articles)
+                            assistant_tools.update_clinic_context(
+                                clinic_info=ci,
+                                settings=st or {},
+                                schedule=schedule,
+                                clinic_tz=clinic_tz,
+                                knowledge_articles=clinic_knowledge_articles,
+                            )
                             refresh_agent_memory()
                             logger.info(f"[SIP LATE] Context refreshed: {ci.get('name')}")
                     except Exception as e:
@@ -1363,12 +2172,18 @@ async def entrypoint(ctx: JobContext):
                 clinic_name = clinic_info.get("name") or clinic_name
                 clinic_tz = clinic_info.get("timezone") or clinic_tz
                 clinic_region = clinic_info.get("default_phone_region") or clinic_region
-                state.tz = clinic_tz
+                schedule = load_schedule_from_settings(settings or {})
+                state.tz = BOOKING_TZ
                 update_global_clinic_info(clinic_info, settings or {})
-                _tools_mod._GLOBAL_SCHEDULE = load_schedule_from_settings(settings or {})
-                _tools_mod._GLOBAL_CLINIC_TZ = clinic_tz
-                # Fetch FAQ now that we have clinic_id
-                clinic_faq = await _fetch_clinic_faq(clinic_info.get("id"))
+                clinic_knowledge_articles = await _fetch_clinic_knowledge_articles(clinic_info.get("id"))
+                clinic_faq = _format_clinic_faq(clinic_knowledge_articles)
+                assistant_tools.update_clinic_context(
+                    clinic_info=clinic_info,
+                    settings=settings or {},
+                    schedule=schedule,
+                    clinic_tz=clinic_tz,
+                    knowledge_articles=clinic_knowledge_articles,
+                )
                 refresh_agent_memory()
                 logger.info(f"[DB] Deferred context loaded: {clinic_name}")
         except Exception as e:

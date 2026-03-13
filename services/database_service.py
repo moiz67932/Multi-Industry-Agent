@@ -11,13 +11,23 @@ from __future__ import annotations
 
 import re
 import os
+import json
 import asyncio
 import traceback
 from typing import Optional, Dict, Any, Tuple, List, cast
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
-from config import supabase, logger, BOOKED_STATUSES, DEFAULT_MIN, DEMO_CLINIC_ID
+from config import (
+    supabase,
+    logger,
+    BOOKED_STATUSES,
+    DEFAULT_MIN,
+    DEMO_CLINIC_ID,
+    BOOKING_TZ,
+    APPOINTMENT_SOURCE_DEFAULT,
+    VALID_APPOINTMENT_SOURCES,
+)
 
 # Import from other new modules
 from utils.cache import _clinic_cache
@@ -375,6 +385,17 @@ async def fetch_day_appointments(
 # TUNING: Kill DB write if it takes longer than 6 seconds
 BOOKING_DB_TIMEOUT_SEC = 6.0 
 
+
+def _normalize_appointment_source(source: Optional[str] = None) -> str:
+    normalized = (source or APPOINTMENT_SOURCE_DEFAULT).strip().lower()
+    if normalized not in VALID_APPOINTMENT_SOURCES:
+        logger.warning(
+            f"[DB] Invalid appointment_source='{normalized}' - falling back to "
+            f"'{APPOINTMENT_SOURCE_DEFAULT}'"
+        )
+        return APPOINTMENT_SOURCE_DEFAULT
+    return normalized
+
 async def book_to_supabase(
     clinic_info: Dict[str, Any],
     patient_state: "PatientState",
@@ -391,8 +412,15 @@ async def book_to_supabase(
             logger.error("[DB] Cannot book: no start_time set")
             return None
 
-        duration = patient_state.duration_minutes or 30
-        end_time = start_time + timedelta(minutes=duration)
+        booking_tz = ZoneInfo(BOOKING_TZ)
+        start_dt = (
+            start_time.astimezone(booking_tz)
+            if start_time.tzinfo is not None
+            else start_time.replace(tzinfo=booking_tz)
+        )
+        duration = patient_state.duration_minutes or 60
+        end_dt = start_dt + timedelta(minutes=duration)
+        appointment_source = _normalize_appointment_source()
 
         payload = {
             "organization_id": clinic_info.get("organization_id"),
@@ -400,11 +428,12 @@ async def book_to_supabase(
             "patient_name": patient_state.full_name,
             "patient_phone_masked": patient_state.phone_e164 or patient_state.phone_pending,
             "patient_email": patient_state.email,
-            "start_time": _iso(start_time),
-            "end_time": _iso(end_time),
+            "reason": patient_state.reason or "General appointment",
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
             "status": "scheduled",
-            "source": "ai",
-            "reason": patient_state.reason or "General Dentistry",
+            "source": appointment_source,
+            "created_at": datetime.utcnow().isoformat(),
         }
 
         if calendar_event_id:
@@ -420,6 +449,10 @@ async def book_to_supabase(
                 return str(first.get("id", ""))
             return None
 
+        debug_payload = {k: str(v) for k, v in payload.items()}
+        debug_payload["reserved_duration_minutes"] = str(duration)
+        logger.info(f"[DB] appointment_source={appointment_source}")
+        logger.debug(f"[DB] Insert payload: {json.dumps(debug_payload, indent=2)}")
         logger.info(f"[DB] Inserting appointment (timeout={BOOKING_DB_TIMEOUT_SEC}s) start={payload['start_time']}")
         
         # Execute with hard timeout

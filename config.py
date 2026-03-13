@@ -50,6 +50,19 @@ FILLER_MAX_DURATION_MS = int(os.getenv("FILLER_MAX_MS", "250"))
 FILLER_DEBOUNCE_MS = int(os.getenv("FILLER_DEBOUNCE_MS", "220"))
 FILLER_PHRASES = ["One moment.", "Let me check."]
 
+# Turn-taking policy settings
+TURN_TRACKER_ENABLED = os.getenv("TURN_TRACKER_ENABLED", "1") == "1"
+DETERMINISTIC_FAST_PATH_ENABLED = os.getenv("DETERMINISTIC_FAST_PATH_ENABLED", "1") == "1"
+TURN_SHORT_PAUSE_MS = int(os.getenv("TURN_SHORT_PAUSE_MS", "900"))
+TURN_CONTINUATION_WAIT_MS = int(os.getenv("TURN_CONTINUATION_WAIT_MS", "650"))
+TURN_LOW_CONFIDENCE_THRESHOLD = float(os.getenv("TURN_LOW_CONFIDENCE_THRESHOLD", "0.6"))
+LOOKUP_FILLER_DELAY_MS = int(os.getenv("LOOKUP_FILLER_DELAY_MS", "260"))
+EXPECTED_SLOT_CONTINUATION_WAIT_MS = int(os.getenv("EXPECTED_SLOT_CONTINUATION_WAIT_MS", "850"))
+EXPECTED_SLOT_WEAK_FRAGMENT_MAX_TOKENS = int(os.getenv("EXPECTED_SLOT_WEAK_FRAGMENT_MAX_TOKENS", "8"))
+EXPECTED_SLOT_ENABLE_DATE_TIME_FAST_PATH = (
+    os.getenv("EXPECTED_SLOT_ENABLE_DATE_TIME_FAST_PATH", "1") == "1"
+)
+
 # STT aggressive endpointing (Deepgram-specific)
 STT_AGGRESSIVE_ENDPOINTING = os.getenv("STT_AGGRESSIVE", "1") == "1"
 
@@ -75,23 +88,33 @@ LOG_BUFFER_FLUSH_INTERVAL = int(os.getenv("LOG_FLUSH_INTERVAL", "10"))
 # Max events in buffer before auto-flush
 LOG_BUFFER_MAX_SIZE = int(os.getenv("LOG_BUFFER_SIZE", "100"))
 
-# Mute noisy transport debug logs (reduces log-bloat in production)
-logging.getLogger("hpack").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
 # =============================================================================
 # STRUCTURED LOGGER
 # =============================================================================
 
 logger = logging.getLogger("snappy_agent")
 logger.setLevel(logging.DEBUG)
-logger.propagate = False
+logger.propagate = False  # Do NOT propagate to root logger (Cloud Run captures root stdout)
+
+# Only add handler if none exist (guards against double-import on module reload)
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
     ))
     logger.addHandler(handler)
+
+# Suppress duplicate propagation on LiveKit loggers
+# Cloud Run captures their stdout natively; propagating to root doubles every line
+for _noisy_logger_name in ("livekit", "livekit.agents", "livekit.rtc", "snappy_agent"):
+    _nl = logging.getLogger(_noisy_logger_name)
+    _nl.propagate = False
+    if not _nl.handlers and _noisy_logger_name != "snappy_agent":
+        _nl.addHandler(logging.StreamHandler())
+
+# Mute noisy transport debug logs
+logging.getLogger("hpack").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # =============================================================================
 # ENVIRONMENT & APPLICATION CONFIG
@@ -103,6 +126,7 @@ ENVIRONMENT = (os.getenv("ENVIRONMENT") or "development").strip().lower()
 LIVEKIT_AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "telephony_agent_v3")
 
 DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Asia/Karachi")
+BOOKING_TZ = os.getenv("BOOKING_TZ", "America/New_York")
 DEFAULT_MIN = int(os.getenv("DEFAULT_APPT_MINUTES", "60"))
 DEFAULT_PHONE_REGION = os.getenv("DEFAULT_PHONE_REGION", "PK")
 
@@ -127,6 +151,9 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # =============================================================================
 
 BOOKED_STATUSES = ["scheduled", "confirmed"]
+APPOINTMENT_SOURCE_AI = "ai"
+APPOINTMENT_SOURCE_DEFAULT = APPOINTMENT_SOURCE_AI
+VALID_APPOINTMENT_SOURCES = frozenset({"ai", "manual", "online", "walk_in"})
 
 # Valid call_sessions.outcome enum values (from Supabase schema)
 VALID_CALL_OUTCOMES = {
@@ -147,7 +174,11 @@ DEMO_CLINIC_ID = os.getenv("DEMO_CLINIC_ID", "5afce5fa-8436-43a3-af65-da29ccad72
 
 DEFAULT_TREATMENT_DURATIONS: Dict[str, int] = {
     "Teeth whitening": 60,
+    "Whitening": 60,
+    "Detoxing appointment": 60,
     "Cleaning": 30,
+    "Teeth cleaning": 30,
+    "Dental cleaning": 30,
     "Consultation": 15,
     "Checkup": 30,
     "Check-up": 30,

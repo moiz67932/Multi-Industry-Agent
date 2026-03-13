@@ -107,6 +107,7 @@ class PatientState:
     delivery_channel: Optional[str] = None
     delivery_preference_pending: bool = False
     delivery_preference_asked: bool = False
+    delivery_ask_count: int = 0
     anything_else_pending: bool = False
     anything_else_asked: bool = False
     user_declined_more_help: bool = False
@@ -148,7 +149,7 @@ class PatientState:
         self.rejected_slots.add(key)
         logger.info(f"[STATE] Slot rejected: {key} ({reason})")
 
-    def remember_user_text(self, text: str, max_items: int = 6):
+    def remember_user_text(self, text: str, max_items: int = 10):
         cleaned = " ".join((text or "").split()).strip()
         if not cleaned:
             return
@@ -157,7 +158,7 @@ class PatientState:
         if len(self.recent_user_texts) > max_items:
             self.recent_user_texts = self.recent_user_texts[-max_items:]
 
-    def recent_user_context(self, limit: int = 4) -> str:
+    def recent_user_context(self, limit: int = 3) -> str:
         return " ".join(self.recent_user_texts[-limit:]).strip()
 
     def is_slot_rejected(self, dt: datetime) -> bool:
@@ -215,7 +216,7 @@ class PatientState:
             else:
                 lines.append("• PHONE: confirmed")
         elif self.phone_pending or self.detected_phone:
-            lines.append("• PHONE: pending confirmation — Ask: 'Should I save the number you're calling from?'")
+            lines.append("• PHONE: pending confirmation — Ask: 'Can I use the number you're calling from for your appointment confirmation and reminders?'")
         else:
             lines.append("• PHONE: ? — Ask naturally")
 

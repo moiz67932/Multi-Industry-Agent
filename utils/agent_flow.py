@@ -7,6 +7,8 @@ from __future__ import annotations
 import re
 from typing import Any, Optional, Sequence
 
+from config import logger
+
 
 YES_CONFIRM_RE = re.compile(
     r"\b(yes|yeah|yep|yup|correct|right|that's right|that is right|ok|okay|sure|please do|go ahead)\b",
@@ -100,6 +102,23 @@ SMS_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+DELIVERY_DEFER_RE = re.compile(
+    r"\b("
+    r"either(?: one| is fine| works| will work)?|"
+    r"doesn't matter|"
+    r"don't care|"
+    r"whatever(?: works| you prefer)?|"
+    r"any(?: of them| is fine| works)?|"
+    r"you choose|"
+    r"your choice|"
+    r"up to you|"
+    r"i don't mind|"
+    r"i don't have a preference|"
+    r"no preference|"
+    r"both work"
+    r")\b",
+    re.IGNORECASE,
+)
 ANYTHING_ELSE_DECLINE_RE = re.compile(
     r"\b("
     r"no(?: thank you| thanks)?|"
@@ -127,6 +146,40 @@ GOODBYE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+NAME_TRAILING_PUNCTUATION_RE = re.compile(r"[\s.,!?;:]+$")
+HESITATION_PREFIX_RE = re.compile(
+    r"^(?:(?:uh|um|er|hmm|ah|well|so|like|you know|i mean|let me think)[\s,.;:!?-]*)+",
+    re.IGNORECASE,
+)
+TIME_LEAD_IN_PREFIX_RE = re.compile(
+    r"^(?:(?:at|around|about)\s+)+",
+    re.IGNORECASE,
+)
+DELIVERY_CONTEXT_RE = re.compile(
+    r"\b(whats\s?app|sms|text|message|confirmation|confirm(?:ation)?|send)\b",
+    re.IGNORECASE,
+)
+DELIVERY_DANGLING_RE = re.compile(
+    r"(?:\b(?:on|to|by|via|for|with|what|which|how)\b|[,:-])\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_patient_name(text: Optional[str]) -> Optional[str]:
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return None
+    normalized = NAME_TRAILING_PUNCTUATION_RE.sub("", normalized).strip()
+    return normalized or None
+
+
+def sanitize_time_slot_text(text: Optional[str]) -> str:
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return ""
+    normalized = HESITATION_PREFIX_RE.sub("", normalized).strip(" ,.;:!?-")
+    normalized = TIME_LEAD_IN_PREFIX_RE.sub("", normalized).strip(" ,.;:!?-")
+    return normalized
 
 
 def store_detected_phone(
@@ -278,11 +331,17 @@ def build_time_parse_candidates(
     primary = " ".join((primary_text or "").split()).strip()
     recent = " ".join((recent_context or "").split()).strip()
     previous = " ".join((previous_text or "").split()).strip()
+    sanitized_primary = sanitize_time_slot_text(primary)
+    sanitized_recent = sanitize_time_slot_text(recent)
 
     candidates: list[str] = []
 
-    if previous and has_date_reference(previous) and has_time_reference(primary) and not has_date_reference(primary):
-        candidates.append(f"{previous} at {primary}")
+    if previous and has_date_reference(previous):
+        combined_time = sanitized_primary or primary
+        if combined_time and has_time_reference(combined_time) and not has_date_reference(combined_time):
+            candidates.append(f"{previous} at {combined_time}")
+        if recent and has_time_reference(sanitized_recent or recent) and not has_date_reference(sanitized_recent or recent):
+            candidates.append(f"{previous} at {sanitized_recent or recent}")
 
     primary_score = time_expression_score(primary)
     recent_score = time_expression_score(recent)
@@ -291,9 +350,13 @@ def build_time_parse_candidates(
 
     if primary:
         candidates.append(primary)
+    if sanitized_primary and sanitized_primary != primary:
+        candidates.append(sanitized_primary)
 
     if recent:
         candidates.append(recent)
+    if sanitized_recent and sanitized_recent != recent:
+        candidates.append(sanitized_recent)
 
     deduped: list[str] = []
     for candidate in candidates:
@@ -307,7 +370,11 @@ def looks_like_phone_input(text: Optional[str]) -> bool:
 
 
 def resolve_delivery_preference(text: Optional[str]) -> Optional[str]:
-    """Return 'whatsapp', 'sms', or None for ambiguous delivery preferences."""
+    """Return 'whatsapp', 'sms', or None for truly ambiguous delivery preferences.
+
+    Defaults to 'whatsapp' when caller expresses no preference because it is the
+    better mobile delivery experience.
+    """
     if not text:
         return None
 
@@ -324,7 +391,46 @@ def resolve_delivery_preference(text: Optional[str]) -> Optional[str]:
         return "whatsapp"
     if sms_positions and whatsapp_positions:
         return "sms" if sms_positions[-1] > whatsapp_positions[-1] else "whatsapp"
+
+    if DELIVERY_DEFER_RE.search(normalized):
+        logger.info("[DELIVERY] Ambiguous preference — defaulting to WhatsApp")
+        return "whatsapp"
+
     return None
+
+
+def looks_like_delivery_follow_up_fragment(text: Optional[str]) -> bool:
+    normalized = " ".join((text or "").split()).strip().lower()
+    if not normalized:
+        return False
+    if resolve_delivery_preference(normalized) is not None:
+        return False
+    if not DELIVERY_CONTEXT_RE.search(normalized):
+        return False
+    if DELIVERY_DANGLING_RE.search(normalized):
+        return True
+    if normalized.startswith(
+        (
+            "uh",
+            "um",
+            "well",
+            "so",
+            "you can send",
+            "can you send",
+            "send it",
+            "send on",
+            "send by",
+            "which one",
+            "what to",
+            "on what",
+            "how should",
+        )
+    ):
+        return True
+    short_words = normalized.split()
+    if len(short_words) <= 6 and "send" in short_words:
+        return True
+    return False
 
 
 def user_declined_anything_else(text: Optional[str]) -> bool:

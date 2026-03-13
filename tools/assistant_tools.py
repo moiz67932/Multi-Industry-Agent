@@ -6,12 +6,13 @@ from __future__ import annotations
 import re
 import time
 import asyncio
-from typing import Optional, Dict, Any, Callable, cast
+from typing import Optional, Dict, Any, Callable, Sequence, cast
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from config import (
     DEFAULT_TZ,
+    BOOKING_TZ,
     BOOKED_STATUSES,
     DEFAULT_PHONE_REGION,
     APPOINTMENT_BUFFER_MINUTES,
@@ -28,7 +29,9 @@ from utils.phone_utils import (
 from utils.agent_flow import (
     build_time_parse_candidates,
     ensure_caller_phone_pending,
+    has_date_reference,
     looks_like_phone_input,
+    normalize_patient_name,
 )
 from services.database_service import is_slot_free_supabase, book_to_supabase
 from services.scheduling_service import (
@@ -43,7 +46,7 @@ from services.appointment_management_service import (
     cancel_appointment,
     reschedule_appointment,
 )
-from services.extraction_service import _iso
+from services.extraction_service import _iso, extract_reason_quick
 from utils.contact_utils import parse_datetime_natural
 
 
@@ -119,9 +122,9 @@ def _contact_reference(state: PatientState) -> str:
 def _phone_confirmation_question(state: PatientState, phone_candidate: str) -> str:
     if (state.phone_source or "").lower() == "user_spoken":
         if state.phone_last4:
-            return f"I have your number ending in {state.phone_last4}. Is that right?"
-        return "I have your number. Is that right?"
-    return "Can I use the number you're calling from?"
+            return "Is this the right number to send your confirmation to?"
+        return "Would you like me to use this number for appointment-related updates?"
+    return "Can I use the number you're calling from for your appointment confirmation and reminders?"
 
 
 def _booking_sentence(state: PatientState) -> str:
@@ -152,11 +155,242 @@ def _apply_delivery_preference(state: PatientState, channel: str) -> str:
     state.prefers_sms = normalized == "sms"
     state.delivery_preference_pending = False
     state.delivery_preference_asked = True
+    state.delivery_ask_count = 0
     logger.info(f"[TOOL] Delivery preference: {normalized}")
 
     if normalized == "sms":
         return "No problem, I'll send it by SMS."
     return "Perfect, I'll send it on WhatsApp."
+
+
+def _date_hint_for_prompt(state: PatientState, *, fallback_text: Optional[str] = None) -> Optional[str]:
+    candidate = " ".join((fallback_text or "").split()).strip()
+    if candidate and has_date_reference(candidate):
+        return candidate
+    if state.dt_local:
+        return state.dt_local.strftime("%A, %B %d")
+    state_dt_text = " ".join((state.dt_text or "").split()).strip()
+    if state_dt_text and has_date_reference(state_dt_text):
+        return state_dt_text
+    return None
+
+
+def _time_reask_text(state: PatientState, *, date_hint: Optional[str] = None) -> str:
+    spoken_date = _date_hint_for_prompt(state, fallback_text=date_hint)
+    if spoken_date:
+        lowered = spoken_date.lower()
+        if lowered in {"today", "tomorrow", "day after tomorrow"}:
+            return f"I didn't catch the time. What time works best {lowered}?"
+        return f"I didn't catch the time. What time works best on {spoken_date}?"
+    return "I didn't catch that time. What time works best for you?"
+
+
+def _is_useful_time_parse_result(result: Dict[str, Any]) -> bool:
+    return bool(
+        result.get("datetime") is not None
+        or result.get("date_only")
+        or result.get("needs_clarification")
+        or result.get("clarification_type")
+    )
+
+
+KNOWLEDGE_STOPWORDS = {
+    "a",
+    "about",
+    "an",
+    "and",
+    "are",
+    "at",
+    "can",
+    "could",
+    "do",
+    "for",
+    "get",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "know",
+    "like",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "please",
+    "tell",
+    "the",
+    "to",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "would",
+    "you",
+    "your",
+}
+QUESTION_LEAD_IN_RE = re.compile(
+    r"\b("
+    r"what|when|where|how(?: much| long)?|"
+    r"do you|can you|could you|would you|"
+    r"tell me|i (?:want|would like) to know|"
+    r"get to know|let me know"
+    r")\b",
+    re.IGNORECASE,
+)
+CLINIC_INFO_HINT_RE = re.compile(
+    r"\b("
+    r"price|prices|pricing|cost|costs|fee|fees|rate|rates|"
+    r"insurance|insured|coverage|covered|accept|take|"
+    r"hours|open|close|closing|location|located|address|parking|park|"
+    r"service|services|procedure|procedures|payment|payments|financing|"
+    r"whitening|cleaning|checkup|consultation|extraction|filling|crown|root canal"
+    r")\b",
+    re.IGNORECASE,
+)
+APPOINTMENT_FLOW_HINT_RE = re.compile(
+    r"\b("
+    r"book|booking|schedule|scheduled|appointment|reschedule|cancel|"
+    r"slot|slots|available|availability|opening|openings|"
+    r"day|time|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"\d{1,2}(?::\d{2})?\s*(?:am|pm)"
+    r")\b",
+    re.IGNORECASE,
+)
+PRICING_HINT_RE = re.compile(r"\b(price|prices|pricing|cost|costs|fee|fees|rate|rates)\b", re.IGNORECASE)
+INSURANCE_HINT_RE = re.compile(r"\b(insurance|insured|coverage|covered|accept|take)\b", re.IGNORECASE)
+HOURS_HINT_RE = re.compile(r"\b(hours|open|close|closing)\b", re.IGNORECASE)
+LOCATION_HINT_RE = re.compile(r"\b(location|located|address)\b", re.IGNORECASE)
+PARKING_HINT_RE = re.compile(r"\b(parking|park)\b", re.IGNORECASE)
+SERVICE_INFO_HINT_RE = re.compile(
+    r"\b(service|services|procedure|procedures|whitening|cleaning|checkup|consultation|extraction|filling|crown|root canal)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_knowledge_articles(articles: Optional[Sequence[Dict[str, Any]]]) -> list[Dict[str, str]]:
+    normalized: list[Dict[str, str]] = []
+    for article in articles or []:
+        if not isinstance(article, dict):
+            continue
+        title = " ".join(str(article.get("title") or "").split()).strip()
+        body = " ".join(str(article.get("body") or "").split()).strip()
+        if title or body:
+            normalized.append({"title": title, "body": body})
+    return normalized
+
+
+def _knowledge_terms(text: Optional[str]) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    return {
+        token
+        for token in normalized.split()
+        if len(token) > 2 and token not in KNOWLEDGE_STOPWORDS
+    }
+
+
+def _question_topic_terms(question: str) -> set[str]:
+    terms = _knowledge_terms(question)
+    service = extract_reason_quick(question)
+    if service:
+        terms.update(_knowledge_terms(service))
+    lower = question.lower()
+    if PRICING_HINT_RE.search(lower):
+        terms.update({"price", "pricing", "cost", "costs", "fee", "fees", "rate", "rates"})
+    if INSURANCE_HINT_RE.search(lower):
+        terms.update({"insurance", "coverage", "covered", "accept", "take"})
+    if HOURS_HINT_RE.search(lower):
+        terms.update({"hours", "open", "close", "closing"})
+    if LOCATION_HINT_RE.search(lower):
+        terms.update({"location", "located", "address"})
+    if PARKING_HINT_RE.search(lower):
+        terms.update({"parking", "park"})
+    if SERVICE_INFO_HINT_RE.search(lower):
+        terms.update({"service", "services", "procedure", "procedures"})
+    return terms
+
+
+def _knowledge_match_score(question: str, *, title: str, body: str) -> int:
+    lower_question = question.lower()
+    haystacks = f"{title} {body}".lower()
+    title_lower = title.lower()
+    body_lower = body.lower()
+    terms = _question_topic_terms(question)
+    if not terms:
+        return 0
+
+    score = 0
+    for term in terms:
+        if term in title_lower:
+            score += 4
+        if term in body_lower:
+            score += 2
+
+    if PRICING_HINT_RE.search(lower_question) and PRICING_HINT_RE.search(haystacks):
+        score += 8
+    if INSURANCE_HINT_RE.search(lower_question) and INSURANCE_HINT_RE.search(haystacks):
+        score += 6
+    if HOURS_HINT_RE.search(lower_question) and HOURS_HINT_RE.search(haystacks):
+        score += 6
+    if LOCATION_HINT_RE.search(lower_question) and LOCATION_HINT_RE.search(haystacks):
+        score += 6
+    if PARKING_HINT_RE.search(lower_question) and PARKING_HINT_RE.search(haystacks):
+        score += 6
+
+    detected_service = extract_reason_quick(question)
+    if detected_service and detected_service.lower() in haystacks:
+        score += 5
+
+    return score
+
+
+def _best_knowledge_article(question: str, articles: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    best_article: Optional[Dict[str, str]] = None
+    best_score = 0
+    for article in articles:
+        title = str(article.get("title") or "")
+        body = str(article.get("body") or "")
+        score = _knowledge_match_score(question, title=title, body=body)
+        if score > best_score:
+            best_score = score
+            best_article = article
+    if best_score < 4:
+        return None
+    return best_article
+
+
+def _compact_answer_text(text: str, *, max_words: int = 34) -> str:
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return ""
+
+    first_sentence = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)[0].strip()
+    candidate = first_sentence or cleaned
+    words = candidate.split()
+    if len(words) > max_words:
+        candidate = " ".join(words[:max_words]).rstrip(",;:") + "..."
+    if candidate and candidate[-1] not in ".!?":
+        candidate += "."
+    return candidate
+
+
+def _looks_like_clinic_info_question(
+    question: Optional[str],
+    *,
+    knowledge_articles: Optional[Sequence[Dict[str, str]]] = None,
+) -> bool:
+    normalized = " ".join((question or "").split()).strip().lower()
+    if not normalized:
+        return False
+    if CLINIC_INFO_HINT_RE.search(normalized):
+        return True
+    if APPOINTMENT_FLOW_HINT_RE.search(normalized):
+        return False
+    if QUESTION_LEAD_IN_RE.search(normalized) and knowledge_articles:
+        return _best_knowledge_article(normalized, knowledge_articles) is not None
+    return False
 
 
 # ============================================================================
@@ -166,13 +400,115 @@ def _apply_delivery_preference(state: PatientState, channel: str) -> str:
 class AssistantTools:
     """Tool functions for the dental AI agent."""
 
-    def __init__(self, state: PatientState):
+    def __init__(
+        self,
+        state: PatientState,
+        clinic_info: Optional[Dict[str, Any]] = None,
+        settings: Optional[Dict[str, Any]] = None,
+        schedule: Optional[Dict[str, Any]] = None,
+        clinic_tz: Optional[str] = None,
+        knowledge_articles: Optional[Sequence[Dict[str, Any]]] = None,
+    ):
         self.state = state
+        self._clinic_info: Dict[str, Any] = clinic_info if clinic_info is not None else (_GLOBAL_CLINIC_INFO or {})
+        self._settings: Dict[str, Any] = settings if settings is not None else (_GLOBAL_AGENT_SETTINGS or {})
+        self._schedule: Dict[str, Any] = schedule if schedule is not None else (_GLOBAL_SCHEDULE or {})
+        self._clinic_tz: str = clinic_tz or _GLOBAL_CLINIC_TZ
+        self._knowledge_articles: list[Dict[str, str]] = _normalize_knowledge_articles(knowledge_articles)
         self._refresh_memory: Optional[Callable[[], None]] = None
         # Optional async callback for speaking a final response directly from a tool,
         # bypassing the LLM re-generation step. Set by agent.py after session is ready.
         # Signature: async def _direct_say_callback(text: str) -> None
         self._direct_say_callback: Optional[Callable] = None
+        self._schedule_auto_disconnect: Optional[Callable] = None
+        if self._clinic_info:
+            logger.info(f"[TOOLS] Instance clinic context updated: {self._clinic_info.get('name')}, tz={self._clinic_tz}")
+
+    def update_clinic_context(
+        self,
+        clinic_info: Dict[str, Any],
+        settings: Optional[Dict[str, Any]] = None,
+        schedule: Optional[Dict[str, Any]] = None,
+        clinic_tz: Optional[str] = None,
+        knowledge_articles: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> None:
+        """Update clinic context after deferred DB load completes."""
+        self._clinic_info = clinic_info or {}
+        if settings is not None:
+            self._settings = settings
+        if schedule is not None:
+            self._schedule = schedule
+        if clinic_tz:
+            self._clinic_tz = clinic_tz
+        if knowledge_articles is not None:
+            self._knowledge_articles = _normalize_knowledge_articles(knowledge_articles)
+        logger.info(f"[TOOLS] Instance clinic context updated: {clinic_info.get('name')}, tz={self._clinic_tz}")
+
+    def can_answer_clinic_question(self, question: Optional[str]) -> bool:
+        return _looks_like_clinic_info_question(
+            question,
+            knowledge_articles=self._knowledge_articles,
+        )
+
+    def _compose_clinic_info_answer(self, question: str) -> Optional[str]:
+        normalized = " ".join((question or "").split()).strip()
+        if not self.can_answer_clinic_question(normalized):
+            return None
+
+        article = _best_knowledge_article(normalized, self._knowledge_articles)
+        if article:
+            snippet = _compact_answer_text(article.get("body") or article.get("title") or "")
+            if snippet:
+                return snippet
+
+        service = extract_reason_quick(normalized) or self.state.reason
+        service_phrase = service.lower() if isinstance(service, str) else "that service"
+        lower = normalized.lower()
+
+        if PRICING_HINT_RE.search(lower):
+            return f"I don't have the exact pricing for {service_phrase} in my notes right now, but the office can confirm the current rate for you."
+        if INSURANCE_HINT_RE.search(lower):
+            return "I don't have the exact insurance details in my notes right now, but the office can confirm coverage for you."
+        if HOURS_HINT_RE.search(lower):
+            return "I don't have the exact office hours in my notes right now, but the office can confirm them for you."
+        if LOCATION_HINT_RE.search(lower) or PARKING_HINT_RE.search(lower):
+            return "I don't have that location detail in my notes right now, but the office can confirm it for you."
+        return "I don't have that exact detail in my notes right now, but the office can confirm it for you."
+
+    @llm.function_tool(
+        description=(
+            "Look up clinic FAQ, pricing, insurance, hours, location, parking, and service details "
+            "from the clinic knowledge bank."
+        )
+    )
+    async def search_clinic_info(self, question: str) -> str:
+        answer = self._compose_clinic_info_answer(question)
+        if answer:
+            return answer
+        return "I don't have that exact detail in my notes right now, but the office can confirm it for you."
+
+    async def answer_clinic_question(
+        self,
+        question: str,
+        *,
+        include_follow_up: bool = False,
+    ) -> Optional[str]:
+        if not self.can_answer_clinic_question(question):
+            return None
+
+        answer = await self.search_clinic_info(question=question)
+        if not include_follow_up:
+            return answer
+
+        state = self.state
+        state.anything_else_pending = True
+        state.anything_else_asked = True
+        state.user_declined_more_help = False
+        state.final_goodbye_sent = False
+        state.user_goodbye_detected = False
+        state.closing_state = "anything_else_pending"
+        _refresh_memory()
+        return f"{answer} Is there anything else I can help you with today?"
 
     @llm.function_tool(
         description=(
@@ -193,10 +529,10 @@ class AssistantTools:
         if not state:
             return "State not initialized."
 
-        schedule = _GLOBAL_SCHEDULE or {}
+        schedule = self._schedule or {}
         updates = []
 
-        name = _sanitize_tool_arg(name)
+        name = normalize_patient_name(_sanitize_tool_arg(name))
         phone = _sanitize_tool_arg(phone)
         email = _sanitize_tool_arg(email)
         reason = _sanitize_tool_arg(reason)
@@ -215,7 +551,7 @@ class AssistantTools:
 
         # === PHONE ===
         if phone and not (state.phone_confirmed and state.phone_e164):
-            clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
+            clinic_region = (self._clinic_info or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
             clean_phone, last4 = _normalize_phone_preserve_plus(phone, clinic_region)
             if clean_phone:
                 state.phone_pending = str(clean_phone)
@@ -243,8 +579,10 @@ class AssistantTools:
 
         # === TIME ===
         if time_suggestion:
-            previous_dt_text = state.dt_text
-            state.dt_text = time_suggestion.strip()
+            previous_dt_text = " ".join((state.dt_text or "").split()).strip() or None
+            previous_dt_local = state.dt_local
+            known_date_text = _date_hint_for_prompt(state, fallback_text=previous_dt_text)
+            cleaned_suggestion = " ".join(time_suggestion.split()).strip()
             state.time_status = "validating"
             logger.info(f"[TOOL] Checking time: {time_suggestion}")
 
@@ -257,28 +595,29 @@ class AssistantTools:
                     "tomorrow","today","monday","tuesday","wednesday",
                     "thursday","friday","saturday","sunday",
                 ]
-                suggestion_lower = time_suggestion.lower()
+                suggestion_lower = cleaned_suggestion.lower()
                 has_date = any(m in suggestion_lower for m in month_words) or bool(re.search(r"\b\d{1,2}[/-]\d{1,2}\b", suggestion_lower))
                 has_time = any(w in suggestion_lower for w in time_only_words) or bool(re.search(r"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b", suggestion_lower, re.IGNORECASE))
 
-                parse_input = time_suggestion
-                if not has_date and has_time and state.dt_text and state.dt_text != time_suggestion:
+                parse_input = cleaned_suggestion
+                if not has_date and has_time and previous_dt_text and previous_dt_text != cleaned_suggestion:
                     # User gave time-only (e.g. "3 PM") — combine with saved date text
-                    combined = f"{state.dt_text} at {time_suggestion}"
+                    combined = f"{previous_dt_text} at {cleaned_suggestion}"
                     logger.info(f"[TOOL] Combined date+time: '{combined}'")
                     parse_input = combined
 
-                result = parse_datetime_natural(parse_input, tz_hint=_GLOBAL_CLINIC_TZ)
+                result = parse_datetime_natural(parse_input, tz_hint=BOOKING_TZ)
                 recent_context = state.recent_user_context() if hasattr(state, "recent_user_context") else ""
                 parse_candidates = build_time_parse_candidates(
-                    time_suggestion,
+                    cleaned_suggestion,
                     recent_context=recent_context,
-                    previous_text=previous_dt_text,
+                    previous_text=known_date_text or previous_dt_text,
                 )
+                parse_candidates = parse_candidates or [parse_input]
                 for candidate in parse_candidates:
                     if candidate == parse_input:
-                        break
-                    attempt = parse_datetime_natural(candidate, tz_hint=_GLOBAL_CLINIC_TZ)
+                        continue
+                    attempt = parse_datetime_natural(candidate, tz_hint=BOOKING_TZ)
                     if (
                         attempt.get("datetime") is not None
                         or attempt.get("date_only")
@@ -296,19 +635,49 @@ class AssistantTools:
                     if parsed_date:
                         state.dt_text = parse_input
                         state.time_status = "pending"
+                        state.time_error = None
+                        state.slot_available = False
                         day_spoken = parsed_date.strftime("%A, %B %d")
                         _refresh_memory()
                         return f"Got it, {day_spoken}. What time works best for you?"
-                    return result.get("message", "Could you specify the time?")
+                    state.dt_text = known_date_text or previous_dt_text
+                    state.time_status = "pending"
+                    state.time_error = "time_missing"
+                    state.slot_available = False
+                    _refresh_memory()
+                    return _time_reask_text(state, date_hint=known_date_text)
 
                 if result.get("needs_clarification"):
+                    state.dt_text = known_date_text or previous_dt_text
+                    state.time_status = "pending"
+                    state.time_error = str(result.get("clarification_type") or "clarification_needed")
+                    state.slot_available = False
+                    _refresh_memory()
                     return result.get("message", "Could you specify the day?")
 
                 parsed = result.get("datetime")
 
                 if not parsed:
-                    return "I didn't catch that time. Try something like 'tomorrow at 2pm' or 'March 15th at 3:30'."
+                    state.dt_text = (
+                        known_date_text
+                        or (cleaned_suggestion if has_date_reference(cleaned_suggestion) else previous_dt_text)
+                    )
+                    state.time_status = "pending"
+                    state.time_error = "time_parse_failed"
+                    state.slot_available = False
+                    state.dt_local = previous_dt_local
+                    _refresh_memory()
+                    if known_date_text:
+                        return _time_reask_text(state, date_hint=known_date_text)
+                    return "I didn't catch that. What day and time would you like?"
 
+                booking_tz = ZoneInfo(BOOKING_TZ)
+                parsed = (
+                    parsed.astimezone(booking_tz)
+                    if parsed.tzinfo is not None
+                    else parsed.replace(tzinfo=booking_tz)
+                )
+                state.dt_text = parse_input
                 logger.info(f"[TOOL] Parsed '{time_suggestion}' → {parsed.isoformat()}")
 
                 time_spoken = parsed.strftime("%I:%M %p").lstrip("0")
@@ -317,10 +686,10 @@ class AssistantTools:
                 is_valid, error_msg = is_within_working_hours(parsed, schedule, state.duration_minutes)
 
                 if is_valid:
-                    clinic_id = str((_GLOBAL_CLINIC_INFO or {}).get("id") or "")
+                    clinic_id = str((self._clinic_info or {}).get("id") or "")
                     if clinic_id:
                         slot_end = parsed + timedelta(minutes=state.duration_minutes + APPOINTMENT_BUFFER_MINUTES)
-                        clinic_info = _GLOBAL_CLINIC_INFO or {}
+                        clinic_info = self._clinic_info or {}
                         slot_free = await is_slot_free_supabase(
                             clinic_id,
                             parsed,
@@ -340,7 +709,7 @@ class AssistantTools:
                                 requested_start_dt=parsed,
                                 duration_minutes=state.duration_minutes,
                                 schedule=schedule,
-                                tz_str=_GLOBAL_CLINIC_TZ,
+                                tz_str=BOOKING_TZ,
                                 count=3,
                                 window_hours=4,
                                 step_min=15,
@@ -389,12 +758,12 @@ class AssistantTools:
                     state.time_status = "invalid"
                     state.time_error = error_msg
                     state.dt_local = None
-                    clinic_id = str((_GLOBAL_CLINIC_INFO or {}).get("id") or "")
-                    start_date = parsed.date() if parsed else datetime.now(ZoneInfo(_GLOBAL_CLINIC_TZ)).date()
+                    clinic_id = str((self._clinic_info or {}).get("id") or "")
+                    start_date = parsed.date() if parsed else datetime.now(ZoneInfo(BOOKING_TZ)).date()
                     alternatives = await get_next_available_slots(
                         clinic_id=clinic_id,
                         schedule=schedule,
-                        tz_str=_GLOBAL_CLINIC_TZ,
+                        tz_str=BOOKING_TZ,
                         duration_minutes=state.duration_minutes,
                         num_slots=2,
                         days_ahead=7,
@@ -409,11 +778,18 @@ class AssistantTools:
 
             except Exception as e:
                 logger.error(f"[TOOL] Time validation error: {e!r}")
-                state.time_status = "error"
+                state.dt_text = (
+                    known_date_text
+                    or (cleaned_suggestion if has_date_reference(cleaned_suggestion) else previous_dt_text)
+                )
+                state.time_status = "pending"
                 state.time_error = "schedule_unavailable"
-                state.dt_local = None
+                state.dt_local = previous_dt_local
                 state.slot_available = False
-                return "I'm having trouble checking the schedule. Could you try a different time?"
+                _refresh_memory()
+                if known_date_text:
+                    return _time_reask_text(state, date_hint=known_date_text)
+                return "I'm having trouble checking the schedule. Could you try a different day or time?"
 
         # Caller ID flow after other updates
         if state.full_name and state.dt_local:
@@ -437,6 +813,8 @@ class AssistantTools:
     @llm.function_tool(description="Confirm or reject caller's phone number. confirmed=True saves it, confirmed=False clears and re-asks.")
     async def confirm_phone(self, confirmed: bool, new_phone: Optional[str] = None, phone_number: Optional[str] = None) -> str:
         state = self.state
+        state.pending_confirm_field = None
+        state.pending_confirm = None
 
         if state.phone_confirmed and state.phone_e164 and confirmed and not new_phone and not phone_number:
             if state.full_name and state.dt_local and state.reason:
@@ -446,7 +824,7 @@ class AssistantTools:
         new_phone = _sanitize_tool_arg(phone_number) or _sanitize_tool_arg(new_phone)
 
         if new_phone:
-            clinic_region = (_GLOBAL_CLINIC_INFO or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
+            clinic_region = (self._clinic_info or {}).get("default_phone_region", DEFAULT_PHONE_REGION)
             clean_phone, last4 = _normalize_phone_preserve_plus(new_phone, clinic_region)
             if clean_phone:
                 existing_phone = state.phone_pending or state.detected_phone or state.phone_e164
@@ -576,14 +954,14 @@ class AssistantTools:
     ) -> str:
         _t0 = time.perf_counter()
         state = self.state
-        clinic_info = _GLOBAL_CLINIC_INFO
-        schedule = _GLOBAL_SCHEDULE or {}
+        clinic_info = self._clinic_info
+        schedule = self._schedule or {}
 
         if not clinic_info:
             return "I'm having trouble accessing the schedule right now."
 
         duration = state.duration_minutes if state else 60
-        tz = ZoneInfo(_GLOBAL_CLINIC_TZ)
+        tz = ZoneInfo(BOOKING_TZ)
         now = datetime.now(tz)
 
         after_datetime = _sanitize_tool_arg(after_datetime)
@@ -592,7 +970,7 @@ class AssistantTools:
         search_start = now
         if after_datetime:
             try:
-                result = parse_datetime_natural(after_datetime, tz_hint=_GLOBAL_CLINIC_TZ)
+                result = parse_datetime_natural(after_datetime, tz_hint=BOOKING_TZ)
                 if result.get("success") and result.get("datetime"):
                     search_start = result["datetime"]
             except Exception as e:
@@ -736,7 +1114,7 @@ class AssistantTools:
     async def confirm_and_book_appointment(self) -> str:
         _t0 = time.perf_counter()
         state = self.state
-        clinic_info = _GLOBAL_CLINIC_INFO
+        clinic_info = self._clinic_info
 
         if not state or not clinic_info:
             return "Sorry, I'm missing clinic details. Could you call back in a moment?"
@@ -756,10 +1134,17 @@ class AssistantTools:
             if not state.phone_e164 or not state.phone_confirmed: missing.append("confirmed phone number")
             return f"I still need: {', '.join(missing)}. Let me get those first."
 
+        booking_tz = ZoneInfo(BOOKING_TZ)
+        state.dt_local = (
+            state.dt_local.astimezone(booking_tz)
+            if state.dt_local.tzinfo is not None
+            else state.dt_local.replace(tzinfo=booking_tz)
+        )
+
         # --- Booking-in-progress mutex: prevents duplicate inserts from concurrent fast-lane tasks ---
         if getattr(state, "booking_in_progress", False):
-            logger.info("[BOOK] Booking already in progress — ignoring duplicate call")
-            return "One moment — I'm finalizing your booking now."
+            logger.info("[BOOK] Booking already in progress — ignoring duplicate call (silent)")
+            raise llm.StopResponse()
 
         state.booking_in_progress = True
         logger.info(f"[BOOK] Starting Supabase insert for {state.full_name}")
@@ -803,6 +1188,7 @@ class AssistantTools:
 
         state.delivery_preference_pending = True
         state.delivery_preference_asked = True
+        state.delivery_ask_count = 0
         state.anything_else_pending = False
         state.anything_else_asked = False
         state.closing_state = "delivery_pending"
@@ -812,7 +1198,7 @@ class AssistantTools:
     @llm.function_tool(description="Find existing appointment for cancel/reschedule. Call silently when user mentions cancelling or rescheduling.")
     async def find_existing_appointment(self) -> str:
         state = self.state
-        clinic_info = _GLOBAL_CLINIC_INFO
+        clinic_info = self._clinic_info
 
         if not clinic_info:
             return "I'm having trouble accessing the system right now."
@@ -829,7 +1215,7 @@ class AssistantTools:
         appointment = await find_appointment_by_phone(
             clinic_id=clinic_info["id"],
             phone_number=phone_to_search,
-            tz_str=_GLOBAL_CLINIC_TZ
+            tz_str=BOOKING_TZ
         )
 
         if appointment:
@@ -890,17 +1276,24 @@ class AssistantTools:
             return "What time would work better for you?"
 
         try:
-            parsed_result = parse_datetime_natural(new_time, tz_hint=_GLOBAL_CLINIC_TZ)
+            parsed_result = parse_datetime_natural(new_time, tz_hint=BOOKING_TZ)
             parsed_new_time = parsed_result.get("datetime") if isinstance(parsed_result, dict) else parsed_result
 
             if not parsed_new_time:
                 return f"I couldn't understand '{new_time}'. Could you try again?"
 
-            clinic_info = _GLOBAL_CLINIC_INFO
+            booking_tz = ZoneInfo(BOOKING_TZ)
+            parsed_new_time = (
+                parsed_new_time.astimezone(booking_tz)
+                if parsed_new_time.tzinfo is not None
+                else parsed_new_time.replace(tzinfo=booking_tz)
+            )
+
+            clinic_info = self._clinic_info
             if not clinic_info:
                 return "I'm having trouble accessing the system."
 
-            schedule = _GLOBAL_SCHEDULE or {}
+            schedule = self._schedule or {}
             duration = appointment.get("duration_minutes", 60)
 
             is_valid, error_msg = is_within_working_hours(parsed_new_time, schedule, duration)
@@ -921,7 +1314,7 @@ class AssistantTools:
                     requested_start_dt=parsed_new_time,
                     duration_minutes=duration,
                     schedule=schedule,
-                    tz_str=_GLOBAL_CLINIC_TZ,
+                    tz_str=BOOKING_TZ,
                     count=3,
                     window_hours=4,
                     step_min=15,
@@ -970,14 +1363,26 @@ class AssistantTools:
 
     @llm.function_tool(description="End the call when the user says goodbye or conversation is complete.")
     async def end_conversation(self) -> str:
-        if self.state:
-            if self.state.booking_confirmed and self.state.delivery_preference_pending:
+        state = self.state
+        if state:
+            if state.booking_confirmed and state.delivery_preference_pending:
                 return "Before ending the call, ask whether they'd like the confirmation on WhatsApp or by SMS."
-            if self.state.booking_confirmed and not self.state.user_declined_more_help:
+            if state.booking_confirmed and not state.user_declined_more_help and not state.anything_else_pending:
                 return "Before ending the call, ask if there is anything else you can help with today."
-            self.state.call_ended = True
-            if self.state.booking_confirmed:
+
+            state.call_ended = True
+            state.final_goodbye_sent = True
+            state.closing_state = "final_goodbye_sent"
+
+            if state.booking_confirmed:
                 logger.info("[CALL_END] Call ending after successful booking")
             else:
                 logger.info("[CALL_END] Call ending at user request")
-        return "Goodbye! Have a great day."
+
+            if self._schedule_auto_disconnect:
+                try:
+                    self._schedule_auto_disconnect(None)
+                except Exception as e:
+                    logger.warning(f"[CALL_END] Failed to schedule disconnect: {e}")
+
+        return "Wonderful. You're all set — we'll see you then. Have a great day."
