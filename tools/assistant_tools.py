@@ -276,6 +276,71 @@ SERVICE_INFO_HINT_RE = re.compile(
     r"\b(service|services|procedure|procedures|whitening|cleaning|checkup|consultation|extraction|filling|crown|root canal)\b",
     re.IGNORECASE,
 )
+DETAIL_REQUEST_RE = re.compile(
+    r"\b(all the details|details|everything|all about|tell me about|information|info)\b",
+    re.IGNORECASE,
+)
+GENERIC_KNOWLEDGE_TERMS = {
+    "accept",
+    "address",
+    "appointments",
+    "book",
+    "booking",
+    "cancel",
+    "cancellation",
+    "card",
+    "cards",
+    "carecredit",
+    "cash",
+    "close",
+    "closing",
+    "cost",
+    "costs",
+    "coverage",
+    "covered",
+    "dentist",
+    "doctor",
+    "doctors",
+    "email",
+    "emergency",
+    "experience",
+    "fee",
+    "fees",
+    "financing",
+    "graduated",
+    "hipaa",
+    "hour",
+    "hours",
+    "insurance",
+    "located",
+    "location",
+    "methods",
+    "metro",
+    "name",
+    "notice",
+    "open",
+    "parking",
+    "park",
+    "payment",
+    "payments",
+    "policies",
+    "policy",
+    "price",
+    "prices",
+    "pricing",
+    "provider",
+    "providers",
+    "rate",
+    "rates",
+    "service",
+    "services",
+    "staff",
+    "station",
+    "team",
+    "transit",
+    "urgent",
+    "visa",
+}
 
 
 def _normalize_knowledge_articles(articles: Optional[Sequence[Dict[str, Any]]]) -> list[Dict[str, str]]:
@@ -331,6 +396,23 @@ def _question_topic_terms(question: str) -> set[str]:
     return terms
 
 
+def _question_specific_terms(question: str) -> set[str]:
+    return {
+        term
+        for term in _question_topic_terms(question)
+        if term not in GENERIC_KNOWLEDGE_TERMS
+    }
+
+
+def _specific_knowledge_match_count(question: str, *, title: str, body: str) -> int:
+    specific_terms = _question_specific_terms(question)
+    if not specific_terms:
+        return 0
+    title_lower = title.lower()
+    body_lower = body.lower()
+    return sum(1 for term in specific_terms if term in title_lower or term in body_lower)
+
+
 def _normalize_knowledge_category(value: Optional[str]) -> str:
     normalized = " ".join(str(value or "").strip().lower().split())
     return normalized
@@ -376,19 +458,26 @@ def _knowledge_match_score(question: str, *, title: str, body: str, category: st
     body_lower = body.lower()
     category_lower = category.lower()
     terms = _question_topic_terms(question)
+    specific_terms = _question_specific_terms(question)
     if not terms:
         return 0
 
     score = 0
+    specific_match_count = 0
     if category_key and category_key in routed_categories:
         score += 14
     for term in terms:
-        if term in title_lower:
+        in_title = term in title_lower
+        in_body = term in body_lower
+        in_category = term in category_lower
+        if in_title:
             score += 4
-        if term in body_lower:
+        if in_body:
             score += 2
-        if term in category_lower:
+        if in_category:
             score += 5
+        if term in specific_terms and (in_title or in_body):
+            specific_match_count += 1
 
     if PRICING_HINT_RE.search(lower_question) and PRICING_HINT_RE.search(haystacks):
         score += 8
@@ -416,40 +505,115 @@ def _knowledge_match_score(question: str, *, title: str, body: str, category: st
     detected_service = extract_reason_quick(question)
     if detected_service and detected_service.lower() in haystacks:
         score += 8
+    if DETAIL_REQUEST_RE.search(lower_question):
+        score += 2
+    if routed_categories.intersection({"pricing", "services"}):
+        if specific_terms and specific_match_count == 0 and not detected_service:
+            score -= 16
+        elif specific_match_count:
+            score += specific_match_count * 4
 
     return score
 
 
-def _best_knowledge_article(question: str, articles: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    best_article: Optional[Dict[str, str]] = None
-    best_score = 0
+def _rank_knowledge_articles(question: str, articles: Sequence[Dict[str, str]]) -> list[tuple[int, Dict[str, str]]]:
+    ranked: list[tuple[int, Dict[str, str]]] = []
     for article in articles:
         title = str(article.get("title") or "")
         body = str(article.get("body") or "")
         category = str(article.get("category") or "")
         score = _knowledge_match_score(question, title=title, body=body, category=category)
-        if score > best_score:
-            best_score = score
-            best_article = article
-    if best_score < 4:
+        if score >= 4:
+            ranked.append((score, article))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def _best_knowledge_article(question: str, articles: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    ranked = _rank_knowledge_articles(question, articles)
+    if not ranked:
         return None
-    return best_article
+    return ranked[0][1]
 
 
-def _compact_answer_text(text: str, *, max_words: int = 34) -> str:
+def _voice_answer_text(text: str, *, max_words: int = 48) -> str:
     cleaned = " ".join((text or "").split()).strip()
     if not cleaned:
         return ""
-
-    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", cleaned) if sentence.strip()]
-    first_sentence = sentences[0] if sentences else cleaned
-    candidate = next((sentence for sentence in sentences if PRICE_VALUE_RE.search(sentence)), first_sentence or cleaned)
-    words = candidate.split()
+    words = cleaned.split()
     if len(words) > max_words:
-        candidate = " ".join(words[:max_words]).rstrip(",;:") + "..."
-    if candidate and candidate[-1] not in ".!?":
-        candidate += "."
-    return candidate
+        cleaned = " ".join(words[:max_words]).rstrip(",;:") + "..."
+    if cleaned and cleaned[-1] not in ".!?":
+        cleaned += "."
+    return cleaned
+
+
+def _select_knowledge_articles_for_answer(
+    question: str,
+    articles: Sequence[Dict[str, str]],
+    *,
+    limit: int = 3,
+) -> list[Dict[str, str]]:
+    ranked = _rank_knowledge_articles(question, articles)
+    if not ranked:
+        return []
+
+    top_score = ranked[0][0]
+    wants_details = bool(DETAIL_REQUEST_RE.search(question))
+    min_score = max(4, top_score - (8 if wants_details else 4))
+
+    selected: list[Dict[str, str]] = []
+    seen_bodies: set[str] = set()
+    for score, article in ranked:
+        if score < min_score:
+            break
+        body_key = " ".join(
+            (
+                str(article.get("title") or ""),
+                str(article.get("body") or ""),
+                str(article.get("category") or ""),
+            )
+        ).strip()
+        if body_key in seen_bodies:
+            continue
+        selected.append(article)
+        seen_bodies.add(body_key)
+        if len(selected) >= limit:
+            break
+
+    return selected or [ranked[0][1]]
+
+
+def _render_knowledge_article(question: str, article: Dict[str, str]) -> str:
+    title = " ".join(str(article.get("title") or "").split()).strip()
+    body = " ".join(str(article.get("body") or "").split()).strip()
+    lower_question = question.lower()
+
+    if STAFF_HINT_RE.search(lower_question) and re.search(r"\bname\b", lower_question) and title:
+        details = body if body else title
+        return _voice_answer_text(f"The doctor's name is {title}. {details}")
+
+    if body:
+        return _voice_answer_text(body, max_words=60 if DETAIL_REQUEST_RE.search(lower_question) else 48)
+    if title:
+        return _voice_answer_text(title)
+    return ""
+
+
+def _compose_knowledge_answer(question: str, articles: Sequence[Dict[str, str]]) -> Optional[str]:
+    selected = _select_knowledge_articles_for_answer(question, articles)
+    if not selected:
+        return None
+
+    parts: list[str] = []
+    for article in selected:
+        rendered = _render_knowledge_article(question, article)
+        if rendered and rendered not in parts:
+            parts.append(rendered)
+
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 def _looks_like_clinic_info_question(
@@ -531,13 +695,30 @@ class AssistantTools:
         if not self.can_answer_clinic_question(normalized):
             return None
 
-        article = _best_knowledge_article(normalized, self._knowledge_articles)
-        if article:
-            snippet = _compact_answer_text(article.get("body") or article.get("title") or "")
-            if snippet:
-                return snippet
+        routed_categories = _question_knowledge_categories(normalized)
+        ranked_articles = _rank_knowledge_articles(normalized, self._knowledge_articles)
+        detected_service = extract_reason_quick(normalized)
+        if routed_categories.intersection({"pricing", "services"}) and not detected_service:
+            specific_terms = _question_specific_terms(normalized)
+            top_specific_match = max(
+                (
+                    _specific_knowledge_match_count(
+                        normalized,
+                        title=str(article.get("title") or ""),
+                        body=str(article.get("body") or ""),
+                    )
+                    for _, article in ranked_articles[:3]
+                ),
+                default=0,
+            )
+            if not specific_terms or top_specific_match == 0:
+                return "I want to make sure I give you the right pricing. Which treatment would you like details for?"
 
-        service = extract_reason_quick(normalized) or self.state.reason
+        composed = _compose_knowledge_answer(normalized, self._knowledge_articles)
+        if composed:
+            return composed
+
+        service = detected_service or self.state.reason
         service_phrase = service.lower() if isinstance(service, str) else "that service"
         lower = normalized.lower()
 

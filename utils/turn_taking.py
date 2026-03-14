@@ -759,8 +759,24 @@ class StreamingTurnTracker:
 def choose_contextual_filler(snapshot: TurnTrackerSnapshot) -> Optional[str]:
     if snapshot.completion_label in {CompletionLabel.INCOMPLETE, CompletionLabel.LIKELY_CONTINUING}:
         return None
+    if snapshot.filler_spoken_for_turn:
+        return None
     if snapshot.deterministic_response:
         return None
+    if snapshot.intent == "clinic_info":
+        service = (snapshot.service or extract_reason_quick(snapshot.current_turn_accumulated_text or "") or "").strip()
+        text = (snapshot.current_turn_accumulated_text or snapshot.latest_finalized_text or "").lower()
+        if service:
+            return f"Sure, let me pull the details on {service.lower()} for you."
+        if re.search(r"\b(doctor|dr\.?|dentist|provider|staff|team)\b", text):
+            return "Sure, let me pull the doctor details for you."
+        if re.search(r"\b(price|prices|pricing|cost|costs|fee|fees|rate|rates)\b", text):
+            return "Sure, let me pull the pricing details for you."
+        if re.search(r"\b(insurance|coverage|covered|accept|take)\b", text):
+            return "Sure, let me pull the insurance details for you."
+        if re.search(r"\b(location|address|parking|park|metro|station|transit)\b", text):
+            return "Sure, let me pull those location details for you."
+        return "Sure, let me pull those details for you."
     if snapshot.intent in {"appointment_lookup", "reschedule", "cancellation"}:
         return "Let me check that for you."
     if snapshot.intent == "general_inquiry":
@@ -903,6 +919,11 @@ def build_policy_decision(
                 if snapshot.deterministic_next_step == "clinic_info.answer"
                 else "policy:expected_slot_fast_path"
             ],
+            filler_text=(
+                filler_text
+                if snapshot.deterministic_next_step == "clinic_info.answer"
+                else None
+            ),
             deterministic_route=snapshot.deterministic_next_step,
         )
 
