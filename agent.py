@@ -240,9 +240,10 @@ WORKFLOW — 1 question at a time, 1-2 sentences max:
 4. Time -> call update_patient_record(time_suggestion="...") with natural language like "tomorrow at 2pm".
    - If slot is taken, the tool returns alternatives — offer them immediately.
    - If user says a month without a day (e.g. "February at 2pm") -> ask which day.
-5. After name+reason+time captured: ask "Can I use the number you're calling from for your appointment confirmation and reminders?"
-   - "yes" / "sure" / similar -> call confirm_phone(confirmed=True) IMMEDIATELY. Do not ask again.
-   - "no" or gives different number -> call update_patient_record(phone=...).
+5. ONLY after name AND reason AND time are ALL captured: ask "Can I use the number you're calling from for your appointment confirmation?"
+   - NEVER ask for phone confirmation until all three of name, reason, and time are confirmed.
+   - If caller says "yes" / "sure" / "use this number" / "the one I'm calling from" -> call confirm_phone(confirmed=True) IMMEDIATELY. Do not ask again.
+   - If caller says "no" or gives a different number -> call update_patient_record(phone=...).
 6. All required fields captured -> call confirm_and_book_appointment IMMEDIATELY. Don't ask "shall I book?".
 7. Read the booking confirmation EXACTLY as the tool returns it. Do not rephrase.
 8. If the booking message asks WhatsApp or SMS, ask that exact question and WAIT for the caller's answer.
@@ -251,7 +252,7 @@ WORKFLOW — 1 question at a time, 1-2 sentences max:
 
 RULES:
 - CLINIC INFO is only a routing/index aid. Never read it verbatim to the caller.
-- For pricing, insurance, hours, parking, or service-detail questions, use `search_clinic_info` or the deterministic clinic-info path instead of improvising from CLINIC INFO.
+- For pricing, hours, service-detail questions, use the deterministic clinic-info path — do not improvise.
 - Call update_patient_record IMMEDIATELY when you hear any info. Never wait.
 - Normalize spoken input before saving: "three one zero" -> "310", "at gmail dot com" -> "@gmail.com".
 - Once caller ID is confirmed, refer to it as "the number you're calling from", "this number", or "your number" — do not repeat the full digits unless the caller asks.
@@ -2214,6 +2215,25 @@ async def entrypoint(ctx: JobContext):
             logger.info(f"[AGENT SAID] '{spoken}'")
             if TURN_TRACKER_ENABLED:
                 _apply_expected_slot_from_output(route=None, spoken_text=spoken)
+
+            # When agent proactively asks for phone confirmation (LLM path, not tool path),
+            # sync state.pending_confirm so the deterministic handler can catch the user's reply.
+            if (
+                state
+                and not state.phone_confirmed
+                and not state.pending_confirm
+                and (
+                    "number you're calling from" in lower
+                    or "number you are calling from" in lower
+                    or "use this number" in lower
+                    or "can i use the" in lower
+                )
+                and (state.phone_e164 or getattr(state, "detected_phone", None) or getattr(state, "phone_pending", None))
+            ):
+                state.pending_confirm = "phone"
+                state.pending_confirm_field = "phone"
+                logger.info("[SYNC] pending_confirm='phone' synced from agent speech (LLM asked phone confirmation)")
+
             if state.appointment_booked and "whatsapp" in lower and "sms" in lower:
                 if not state.delivery_preference_pending:
                     state.delivery_preference_pending = True

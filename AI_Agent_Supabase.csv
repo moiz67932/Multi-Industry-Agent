@@ -1,0 +1,101 @@
+table_name,ordinal_position,column_name,data_type,postgres_type,is_nullable,column_default
+agent_settings,1,id,uuid,uuid,NO,gen_random_uuid()
+agent_settings,2,organization_id,uuid,uuid,NO,null
+agent_settings,3,agent_id,uuid,uuid,NO,null
+agent_settings,4,persona_tone,USER-DEFINED,persona_tone,NO,'friendly'::persona_tone
+agent_settings,5,greeting_text,text,text,YES,"'Hi, thanks for calling! Are you a new or returning patient?'::text"
+agent_settings,6,collect_insurance,boolean,bool,NO,false
+agent_settings,7,insurance_prompt,text,text,YES,null
+agent_settings,8,emergency_triage_enabled,boolean,bool,NO,true
+agent_settings,9,emergency_triage_prompt,text,text,YES,null
+agent_settings,10,booking_confirmation_enabled,boolean,bool,NO,true
+agent_settings,11,reschedule_enabled,boolean,bool,NO,true
+agent_settings,12,cancellation_enabled,boolean,bool,NO,true
+agent_settings,13,config_json,jsonb,jsonb,YES,'{}'::jsonb
+agent_settings,14,created_at,timestamp with time zone,timestamptz,NO,now()
+agent_settings,15,updated_at,timestamp with time zone,timestamptz,NO,now()
+agent_settings,16,google_oauth_token,jsonb,jsonb,YES,null
+agents,1,id,uuid,uuid,NO,gen_random_uuid()
+agents,2,organization_id,uuid,uuid,NO,null
+agents,3,clinic_id,uuid,uuid,NO,null
+agents,4,name,text,text,NO,null
+agents,5,default_language,text,text,NO,'en-US'::text
+agents,6,status,USER-DEFINED,agent_status,NO,'offline'::agent_status
+agents,7,created_at,timestamp with time zone,timestamptz,NO,now()
+agents,8,updated_at,timestamp with time zone,timestamptz,NO,now()
+api_keys,1,id,uuid,uuid,NO,gen_random_uuid()
+api_keys,2,organization_id,uuid,uuid,NO,null
+api_keys,3,name,text,text,NO,null
+api_keys,4,key_prefix,text,text,NO,null
+api_keys,5,key_hash,text,text,NO,null
+api_keys,6,scopes_json,jsonb,jsonb,YES,'[]'::jsonb
+api_keys,7,expires_at,timestamp with time zone,timestamptz,YES,null
+api_keys,8,last_used_at,timestamp with time zone,timestamptz,YES,null
+api_keys,9,created_at,timestamp with time zone,timestamptz,NO,now()
+appointment_type_providers,1,id,uuid,uuid,NO,gen_random_uuid()
+appointment_type_providers,2,organization_id,uuid,uuid,NO,null
+appointment_type_providers,3,appointment_type_id,uuid,uuid,NO,null
+appointment_type_providers,4,provider_id,uuid,uuid,NO,null
+appointment_types,1,id,uuid,uuid,NO,gen_random_uuid()
+appointment_types,2,organization_id,uuid,uuid,NO,null
+appointment_types,3,clinic_id,uuid,uuid,NO,null
+appointment_types,4,name,text,text,NO,null
+appointment_types,5,description,text,text,YES,null
+appointment_types,6,duration_minutes,integer,int4,NO,30
+appointment_types,7,color_hex,text,text,YES,'#3B82F6'::text
+appointment_types,8,active,boolean,bool,NO,true
+appointment_types,9,created_at,timestamp with time zone,timestamptz,NO,now()
+appointments,1,id,uuid,uuid,NO,gen_random_uuid()
+appointments,2,organization_id,uuid,uuid,NO,null
+appointments,3,clinic_id,uuid,uuid,NO,null
+appointments,4,provider_id,uuid,uuid,YES,null
+appointments,5,appointment_type_id,uuid,uuid,YES,null
+appointments,6,call_session_id,uuid,uuid,YES,null
+appointments,7,patient_name,text,text,YES,null
+appointments,8,patient_phone_masked,text,text,YES,null
+appointments,9,patient_email,text,text,YES,null
+appointments,10,start_time,timestamp with time zone,timestamptz,NO,null
+appointments,11,end_time,timestamp with time zone,timestamptz,NO,null
+appointments,12,status,USER-DEFINED,appointment_status,NO,'scheduled'::appointment_status
+appointments,13,source,USER-DEFINED,appointment_source,NO,'ai'::appointment_source
+appointments,14,reason,text,text,YES,null
+appointments,15,notes,text,text,YES,null
+appointments,16,insurance_info,jsonb,jsonb,YES,null
+appointments,17,created_at,timestamp with time zone,timestamptz,NO,now()
+appointments,18,updated_at,timestamp with time zone,timestamptz,NO,now()
+appointments,19,calendar_provider,text,text,YES,null
+appointments,20,calendar_id,text,text,YES,null
+appointments,21,calendar_event_id,text,text,YES,null
+audit_logs,1,id,uuid,uuid,NO,gen_random_uuid()
+audit_logs,2,organization_id,uuid,uuid,NO,null
+audit_logs,3,user_id,uuid,uuid,YES,null
+audit_logs,4,action,text,text,NO,null
+audit_logs,5,resource_type,text,text,NO,null
+audit_logs,6,resource_id,uuid,uuid,YES,null
+audit_logs,7,details,jsonb,jsonb,YES,'{}'::jsonb
+audit_logs,8,ip_address,text,text,YES,null
+audit_logs,9,user_agent,text,text,YES,null
+audit_logs,10,created_at,timestamp with time zone,timestamptz,NO,now()
+calendar_connections,1,id,uuid,uuid,NO,gen_random_uuid()
+calendar_connections,2,organization_id,uuid,uuid,NO,null
+calendar_connections,3,clinic_id,uuid,uuid,NO,null
+calendar_connections,4,provider,text,text,NO,'google'::text
+calendar_connections,5,calendar_id,text,text,NO,null
+calendar_connections,6,timezone,text,text,YES,null
+calendar_connections,7,enabled,boolean,bool,NO,true
+calendar_connections,8,oauth_token_secret_id,uuid,uuid,YES,null
+calendar_connections,9,service_account_secret_id,uuid,uuid,YES,null
+calendar_connections,10,delegated_user,text,text,YES,null
+calendar_connections,11,created_at,timestamp with time zone,timestamptz,NO,now()
+calendar_connections,12,updated_at,timestamp with time zone,timestamptz,NO,now()
+call_events,1,id,uuid,uuid,NO,gen_random_uuid()
+call_events,2,call_id,uuid,uuid,NO,null
+call_events,3,event_type,text,text,NO,null
+call_events,4,payload,jsonb,jsonb,NO,null
+call_events,5,latency_ms,integer,int4,YES,null
+call_events,6,created_at,timestamp with time zone,timestamptz,YES,now()
+call_sessions,1,id,uuid,uuid,NO,gen_random_uuid()
+call_sessions,2,organization_id,uuid,uuid,NO,null
+call_sessions,3,clinic_id,uuid,uuid,NO,null
+call_sessions,4,agent_id,uuid,uuid,NO,null
+call_sessions,5,phone_number_id,uuid,uuid,YES,null

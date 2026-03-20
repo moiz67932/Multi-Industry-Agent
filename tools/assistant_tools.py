@@ -1500,7 +1500,12 @@ class AssistantTools:
                             return f"Perfect. {day_spoken} at {time_spoken} is open. {phone_prompt}"
 
                     _refresh_memory()
-                    return f"Got it — {day_spoken} at {time_spoken} is available. Continue gathering remaining info."
+                    if not state.full_name:
+                        return f"Got it, {day_spoken} at {time_spoken} works. What name should I put on the appointment?"
+                    elif not state.reason:
+                        return f"Got it, {day_spoken} at {time_spoken} works. What brings you in today?"
+                    else:
+                        return f"Got it, {day_spoken} at {time_spoken} works."
 
                 else:
                     state.time_status = "invalid"
@@ -1631,7 +1636,7 @@ class AssistantTools:
             state.pending_confirm_field = None if state.pending_confirm_field == "phone" else state.pending_confirm_field
             logger.info(f"[TOOL] Phone rejected (was {old})")
             _refresh_memory()
-            return "Phone cleared. Ask: 'What number should I use instead?'"
+            return "No problem. What number would you like me to use instead?"
 
     @llm.function_tool(description="Save whether appointment confirmation should be sent on WhatsApp or SMS.")
     async def set_delivery_preference(self, channel: str) -> str:
