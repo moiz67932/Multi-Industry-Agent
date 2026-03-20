@@ -97,29 +97,136 @@ def extract_name_quick(text: str) -> Optional[str]:
     return None
 
 
-def extract_reason_quick(text: str) -> Optional[str]:
-    """Quick service extraction."""
+DENTAL_SERVICE_MAP = {
+    "whiten": "Teeth whitening",
+    "whitening": "Teeth whitening",
+    "clean": "Cleaning",
+    "cleaning": "Cleaning",
+    "checkup": "Checkup",
+    "check-up": "Checkup",
+    "exam": "Checkup",
+    "pain": "Tooth pain",
+    "toothache": "Tooth pain",
+    "consult": "Consultation",
+    "extract": "Extraction",
+    "filling": "Filling",
+    "crown": "Crown",
+    "root canal": "Root canal",
+}
+
+SPA_SERVICE_MAP = {
+    # Injectables
+    "botox": "Botox",
+    "dysport": "Dysport",
+    "xeomin": "Xeomin",
+    "filler": "Dermal Filler",
+    "lip filler": "Lip Filler",
+    "lip flip": "Lip Flip",
+    "kybella": "Kybella",
+    "prp": "PRP Treatment",
+    "sculptra": "Sculptra",
+    # Laser & Energy Treatments
+    "laser": "Laser Treatment",
+    "ipl": "IPL Photofacial",
+    "photofacial": "IPL Photofacial",
+    "laser hair removal": "Laser Hair Removal",
+    "laser hair": "Laser Hair Removal",
+    "hair removal": "Laser Hair Removal",
+    "laser resurfacing": "Laser Resurfacing",
+    "fraxel": "Fraxel Laser",
+    "co2 laser": "CO2 Laser",
+    "microlaser": "MicroLaser Peel",
+    "radiofrequency": "Radiofrequency Treatment",
+    "rf": "Radiofrequency Treatment",
+    "ultherapy": "Ultherapy",
+    "thermage": "Thermage",
+    "emsculpt": "Emsculpt",
+    "coolsculpting": "CoolSculpting",
+    "body contouring": "Body Contouring",
+    # Facials & Skin Treatments
+    "facial": "Facial",
+    "hydrafacial": "HydraFacial",
+    "hydra facial": "HydraFacial",
+    "chemical peel": "Chemical Peel",
+    "peel": "Chemical Peel",
+    "microdermabrasion": "Microdermabrasion",
+    "microneedling": "Microneedling",
+    "dermaplaning": "Dermaplaning",
+    "led": "LED Light Therapy",
+    "led therapy": "LED Light Therapy",
+    "oxygen facial": "Oxygen Facial",
+    "teen facial": "Teen Facial",
+    "acne facial": "Acne Facial",
+    "brightening": "Brightening Facial",
+    "anti-aging": "Anti-Aging Facial",
+    "anti aging": "Anti-Aging Facial",
+    # Body Treatments
+    "massage": "Massage",
+    "swedish massage": "Swedish Massage",
+    "deep tissue": "Deep Tissue Massage",
+    "hot stone": "Hot Stone Massage",
+    "prenatal massage": "Prenatal Massage",
+    "couples massage": "Couples Massage",
+    "body wrap": "Body Wrap",
+    "body scrub": "Body Scrub",
+    "salt scrub": "Salt Scrub",
+    "cellulite": "Cellulite Treatment",
+    # Waxing & Hair Removal
+    "wax": "Waxing",
+    "waxing": "Waxing",
+    "brazilian": "Brazilian Wax",
+    "brow wax": "Brow Wax",
+    "full body wax": "Full Body Wax",
+    "lip wax": "Lip Wax",
+    "sugaring": "Sugaring",
+    # Brow & Lash Services
+    "brow": "Brow Service",
+    "brow tint": "Brow Tint",
+    "brow lamination": "Brow Lamination",
+    "brow shaping": "Brow Shaping",
+    "microblading": "Microblading",
+    "brow tattoo": "Microblading",
+    "lash": "Lash Service",
+    "lash lift": "Lash Lift",
+    "lash extensions": "Lash Extensions",
+    "lash tint": "Lash Tint",
+    # Nails
+    "manicure": "Manicure",
+    "pedicure": "Pedicure",
+    "gel manicure": "Gel Manicure",
+    "gel nails": "Gel Nails",
+    "nail art": "Nail Art",
+    # Consultations / Other
+    "consultation": "Consultation",
+    "consult": "Consultation",
+    "skin consultation": "Skin Consultation",
+    "patch test": "Patch Test",
+    "gift card": "Gift Card Inquiry",
+    "membership": "Membership Inquiry",
+    "package": "Package Inquiry",
+}
+
+
+def _match_service_map(text: str, service_map: dict[str, str]) -> Optional[str]:
+    """Match text against a service keyword map, trying longer keys first."""
     t = text.lower()
-    service_map = {
-        "whiten": "Teeth whitening",
-        "whitening": "Teeth whitening",
-        "clean": "Cleaning",
-        "cleaning": "Cleaning",
-        "checkup": "Checkup",
-        "check-up": "Checkup",
-        "exam": "Checkup",
-        "pain": "Tooth pain",
-        "toothache": "Tooth pain",
-        "consult": "Consultation",
-        "extract": "Extraction",
-        "filling": "Filling",
-        "crown": "Crown",
-        "root canal": "Root canal",
-    }
-    for key, value in service_map.items():
+    # Sort by key length descending so "laser hair removal" matches before "laser"
+    for key in sorted(service_map.keys(), key=len, reverse=True):
         if key in t:
-            return value
+            return service_map[key]
     return None
+
+
+def extract_spa_service_quick(text: str) -> Optional[str]:
+    """Quick spa service extraction using SPA_SERVICE_MAP."""
+    return _match_service_map(text, SPA_SERVICE_MAP)
+
+
+def extract_reason_quick(text: str, industry_type: str = "dental") -> Optional[str]:
+    """Quick service extraction. Delegates to the appropriate map based on industry."""
+    if industry_type == "med_spa":
+        return extract_spa_service_quick(text)
+    return _match_service_map(text, DENTAL_SERVICE_MAP)
 
 
 def _iso(dt: datetime) -> str:

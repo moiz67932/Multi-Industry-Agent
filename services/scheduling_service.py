@@ -22,6 +22,87 @@ from zoneinfo import ZoneInfo
 from config import DEFAULT_TREATMENT_DURATIONS, DEFAULT_LUNCH_BREAK, logger, DEFAULT_TZ, supabase
 from services.database_service import is_slot_free_supabase
 
+# ==========================================================================
+# Default spa treatment durations (minutes)
+# ==========================================================================
+
+DEFAULT_SPA_TREATMENT_DURATIONS: Dict[str, int] = {
+    # Injectables
+    "Consultation": 30,
+    "Botox": 30,
+    "Dysport": 30,
+    "Dermal Filler": 45,
+    "Lip Filler": 30,
+    "Lip Flip": 15,
+    "Kybella": 45,
+    "PRP Treatment": 60,
+    "Sculptra": 45,
+    # Laser
+    "Laser Treatment": 60,
+    "IPL Photofacial": 60,
+    "Laser Hair Removal": 45,
+    "Laser Resurfacing": 90,
+    "Fraxel Laser": 90,
+    "CO2 Laser": 90,
+    "MicroLaser Peel": 60,
+    "Radiofrequency Treatment": 60,
+    "Ultherapy": 90,
+    "Thermage": 90,
+    "Emsculpt": 30,
+    "CoolSculpting": 60,
+    "Body Contouring": 60,
+    # Facials
+    "Facial": 60,
+    "HydraFacial": 60,
+    "Chemical Peel": 45,
+    "Microdermabrasion": 45,
+    "Microneedling": 60,
+    "Dermaplaning": 45,
+    "LED Light Therapy": 30,
+    "Oxygen Facial": 60,
+    "Teen Facial": 45,
+    "Acne Facial": 60,
+    "Brightening Facial": 60,
+    "Anti-Aging Facial": 75,
+    # Body
+    "Massage": 60,
+    "Swedish Massage": 60,
+    "Deep Tissue Massage": 60,
+    "Hot Stone Massage": 90,
+    "Prenatal Massage": 60,
+    "Couples Massage": 60,
+    "Body Wrap": 75,
+    "Body Scrub": 45,
+    "Salt Scrub": 45,
+    "Cellulite Treatment": 60,
+    # Waxing
+    "Waxing": 30,
+    "Brazilian Wax": 30,
+    "Brow Wax": 15,
+    "Full Body Wax": 90,
+    "Lip Wax": 15,
+    "Sugaring": 45,
+    # Brow & Lash
+    "Brow Service": 30,
+    "Brow Tint": 30,
+    "Brow Lamination": 60,
+    "Brow Shaping": 30,
+    "Microblading": 120,
+    "Lash Service": 60,
+    "Lash Lift": 60,
+    "Lash Extensions": 120,
+    "Lash Tint": 30,
+    # Nails
+    "Manicure": 45,
+    "Pedicure": 60,
+    "Gel Manicure": 60,
+    "Gel Nails": 75,
+    "Nail Art": 90,
+    # Misc
+    "Patch Test": 15,
+    "Skin Consultation": 30,
+}
+
 # Week day keys for schedule mapping (Monday=0 to Sunday=6)
 WEEK_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -97,8 +178,12 @@ def load_schedule_from_settings(settings: Optional[Dict[str, Any]]) -> Dict[str,
         except Exception:
             pass
     
-    # Treatment durations: merge defaults with config overrides
-    treatment_durations = DEFAULT_TREATMENT_DURATIONS.copy()
+    # Treatment durations: pick base defaults by industry, then merge config overrides
+    industry_type = cfg.get("industry_type", "dental")
+    if industry_type == "med_spa":
+        treatment_durations = DEFAULT_SPA_TREATMENT_DURATIONS.copy()
+    else:
+        treatment_durations = DEFAULT_TREATMENT_DURATIONS.copy()
     cfg_durations = cfg.get("treatment_durations") or {}
     if isinstance(cfg_durations, dict):
         for service, mins in cfg_durations.items():

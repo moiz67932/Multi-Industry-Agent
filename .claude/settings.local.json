@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(.venv/Scripts/python -m unittest tests/test_latency_paths.py -v)",
-      "Bash(.venv/Scripts/python.exe -m unittest tests.test_agent_flow tests.test_agent_runtime_config -v)"
+      "Bash(.venv/Scripts/python.exe -m unittest tests.test_agent_flow tests.test_agent_runtime_config -v)",
+      "mcp__supabase__list_tables",
+      "Bash(/tmp/compare_prompts.txt:*)",
+      "Read(//tmp/**)"
     ]
   },
   "enableAllProjectMcpServers": true,

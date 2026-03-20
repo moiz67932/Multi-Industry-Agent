@@ -137,6 +137,7 @@ from tools.assistant_tools import (
     prune_clinic_response_for_tts,
     update_global_clinic_info,
 )
+from industry_profiles import get_profile, IndustryProfile
 
 # =============================================================================
 # Per-turn latency instrumentation
@@ -581,7 +582,7 @@ def _needs_filler(text: str, state: Optional[PatientState] = None) -> bool:
     return decision.filler_text is not None
 
 
-def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any]) -> list[str]:
+def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any], industry_type: str = "dental") -> list[str]:
     """Fill obvious missing slots from recent caller context without waiting on the LLM."""
     updates: list[str] = []
     recent_context = state.recent_user_context(limit=3)
@@ -596,7 +597,7 @@ def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any
             updates.append(f"name={normalized_name}")
 
     if not state.reason:
-        detected_reason = extract_reason_quick(recent_context)
+        detected_reason = extract_reason_quick(recent_context, industry_type=industry_type)
         if detected_reason:
             state.reason = detected_reason
             state.duration_minutes = get_duration_for_service(detected_reason, schedule)
@@ -1331,16 +1332,56 @@ async def entrypoint(ctx: JobContext):
             store_detected_phone(state, clean_phone, last4, source="sip")
             state.phone_confirmed = False
 
-    # Push globals for tools
+    # Push globals for tools (industry_type set after profile detection below)
     update_global_clinic_info(clinic_info, settings or {})
     logger.info(f"[TZ] Booking timezone locked to: {BOOKING_TZ} (clinic field='{clinic_tz}' ignored for datetime math)")
 
     schedule = load_schedule_from_settings(settings or {})
     import tools.assistant_tools as _tools_mod
 
+    # ── Industry profile detection ───────────────────────────────────────────
+    _config_json = (settings or {}).get("config_json", {})
+    if isinstance(_config_json, str):
+        try:
+            _config_json = json.loads(_config_json)
+        except Exception:
+            _config_json = {}
+    industry_type: str = (_config_json.get("industry_type") or "dental") if isinstance(_config_json, dict) else "dental"
+    industry_profile: IndustryProfile = get_profile(industry_type)
+    logger.info(f"[INDUSTRY] Profile loaded: {industry_profile.industry_type} ({industry_profile.display_name})")
+
+    # Push industry_type to tools module
+    _tools_mod._GLOBAL_INDUSTRY_TYPE = industry_type
+
+    # Override module-level filler lists with industry-specific phrases
+    global FILLER_THINKING, FILLER_ACKNOWLEDGE, FILLER_GENERAL
+    if industry_profile.filler_phrases:
+        FILLER_THINKING = industry_profile.filler_phrases.get("thinking", FILLER_THINKING)
+        FILLER_ACKNOWLEDGE = industry_profile.filler_phrases.get("acknowledge", FILLER_ACKNOWLEDGE)
+        FILLER_GENERAL = industry_profile.filler_phrases.get("general", FILLER_GENERAL)
+        logger.info(f"[INDUSTRY] Filler phrases updated for {industry_profile.industry_type}")
+
     # Fetch clinic FAQ (replaces RAG — one query, injected into prompt)
     clinic_knowledge_articles = await _fetch_clinic_knowledge_articles((clinic_info or {}).get("id"))
     clinic_faq = _format_clinic_faq(clinic_knowledge_articles)
+
+    # ── Build business hours string from schedule ────────────────────────────
+    def _format_business_hours(sched: dict) -> str:
+        wh = sched.get("working_hours", {})
+        parts = []
+        for day_key in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]:
+            intervals = wh.get(day_key, [])
+            day_label = {"mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu", "fri": "Fri", "sat": "Sat", "sun": "Sun"}[day_key]
+            if not intervals:
+                parts.append(f"{day_label}: closed")
+            else:
+                spans = []
+                for iv in intervals:
+                    spans.append(f"{iv['start']}-{iv['end']}")
+                parts.append(f"{day_label}: {', '.join(spans)}")
+        return "; ".join(parts)
+
+    business_hours_str = _format_business_hours(schedule)
 
     # ── System prompt builder ─────────────────────────────────────────────────
     _active_pipeline = os.getenv("ACTIVE_PIPELINE", "english").strip().lower()
@@ -1348,15 +1389,28 @@ async def entrypoint(ctx: JobContext):
 
     def get_updated_instructions() -> str:
         now = datetime.now(ZoneInfo(BOOKING_TZ))
-        template = URDU_SYSTEM_PROMPT if _is_urdu else SYSTEM_PROMPT
-        return template.format(
+        if _is_urdu:
+            return URDU_SYSTEM_PROMPT.format(
+                agent_name=agent_name,
+                clinic_name=clinic_name,
+                timezone=BOOKING_TZ,
+                current_date=now.strftime("%A, %B %d, %Y"),
+                current_time=now.strftime("%I:%M %p"),
+                state_summary=state.detailed_state_for_prompt(),
+                clinic_context=clinic_faq,
+            )
+        # Use industry profile system prompt template
+        return industry_profile.get_system_prompt(
             agent_name=agent_name,
             clinic_name=clinic_name,
+            spa_name=clinic_name,  # alias for med_spa template
             timezone=BOOKING_TZ,
             current_date=now.strftime("%A, %B %d, %Y"),
             current_time=now.strftime("%I:%M %p"),
             state_summary=state.detailed_state_for_prompt(),
             clinic_context=clinic_faq,
+            spa_context=clinic_faq,  # alias for med_spa template
+            business_hours=business_hours_str,
         )
 
     # ── Pipeline components ───────────────────────────────────────────────────
@@ -1384,6 +1438,7 @@ async def entrypoint(ctx: JobContext):
         schedule=schedule,
         clinic_tz=clinic_tz,
         knowledge_articles=clinic_knowledge_articles,
+        industry_type=industry_type,
     )
     function_tools = llm.find_function_tools(assistant_tools)
     _session_refs: Dict[str, Any] = {"session": None, "agent": None}
@@ -1638,7 +1693,7 @@ async def entrypoint(ctx: JobContext):
     class ReceptionAgent(Agent):
         async def on_user_turn_completed(self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> None:
             text = (new_message.text_content or "").strip()
-            seeded = _seed_state_from_recent_context(state, schedule)
+            seeded = _seed_state_from_recent_context(state, schedule, industry_type=industry_type)
             if seeded:
                 logger.info(f"[STATE PREFILL] {' | '.join(seeded)}")
                 refresh_agent_memory()

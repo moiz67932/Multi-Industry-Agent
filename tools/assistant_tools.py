@@ -59,20 +59,25 @@ _GLOBAL_CLINIC_INFO: Optional[Dict[str, Any]] = None
 _GLOBAL_AGENT_SETTINGS: Optional[Dict[str, Any]] = None
 _REFRESH_AGENT_MEMORY: Optional[Callable[[], None]] = None
 _GLOBAL_SCHEDULE: Optional[Dict[str, Any]] = None
+_GLOBAL_INDUSTRY_TYPE: str = "dental"
 
 
 def update_global_clinic_info(
     info: Dict[str, Any],
     settings: Optional[Dict[str, Any]] = None,
+    industry_type: Optional[str] = None,
 ) -> None:
     """Called by agent.py to inject the database context including timezone."""
-    global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS, _GLOBAL_CLINIC_TZ
+    global _GLOBAL_CLINIC_INFO, _GLOBAL_AGENT_SETTINGS, _GLOBAL_CLINIC_TZ, _GLOBAL_INDUSTRY_TYPE
     _GLOBAL_CLINIC_INFO = info or {}
     if settings:
         _GLOBAL_AGENT_SETTINGS = settings
     if info and info.get("timezone"):
         _GLOBAL_CLINIC_TZ = info["timezone"]
         logger.info(f"[TOOLS] Timezone updated to: {_GLOBAL_CLINIC_TZ}")
+    if industry_type:
+        _GLOBAL_INDUSTRY_TYPE = industry_type
+        logger.info(f"[TOOLS] Industry type set to: {_GLOBAL_INDUSTRY_TYPE}")
 
 
 # ============================================================================
@@ -288,6 +293,27 @@ SERVICE_FOLLOW_UP_HINT_RE = re.compile(
     r"\b(type|kind|option|options|better|best|difference|compare|versus|vs)\b",
     re.IGNORECASE,
 )
+
+# ── Spa-specific hint patterns (only affect knowledge base matching) ──────
+MEMBERSHIP_HINT_RE = re.compile(
+    r"\b(membership|member|monthly|package|bundle|series|prepaid)\b", re.I)
+PRE_CARE_HINT_RE = re.compile(
+    r"\b(pre.?care|before|prepare|avoid|beforehand|prep)\b", re.I)
+POST_CARE_HINT_RE = re.compile(
+    r"\b(post.?care|after|aftercare|recovery|downtime|healing|bruising|redness)\b", re.I)
+CONTRAINDICATION_HINT_RE = re.compile(
+    r"\b(pregnant|pregnancy|nursing|breastfeeding|allergic|allergy|sensitive|medication|accutane|retinol|blood thin)\b", re.I)
+RESULTS_HINT_RE = re.compile(
+    r"\b(results|how long|last|effective|before.?after|expect|difference)\b", re.I)
+CONSULTATION_HINT_RE = re.compile(
+    r"\b(consultation|consult|first time|new patient|first visit|never had)\b", re.I)
+GRATUITY_HINT_RE = re.compile(
+    r"\b(tip|gratuity|gratu|tipping)\b", re.I)
+CANCELLATION_HINT_RE = re.compile(
+    r"\b(cancel|cancellation|reschedule|policy|fee|charge|no.?show|late)\b", re.I)
+ARRIVAL_HINT_RE = re.compile(
+    r"\b(arrive|arrival|early|check.?in|intake|forms|paperwork|how early)\b", re.I)
+
 KNOWLEDGE_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|;\s+")
 ANYTHING_ELSE_FOLLOW_UP_TEXT = "Is there anything else I can help you with today?"
 GENERIC_SERVICE_TERMS = {
@@ -405,7 +431,7 @@ def _knowledge_terms(text: Optional[str]) -> set[str]:
 
 def _question_topic_terms(question: str) -> set[str]:
     terms = _knowledge_terms(question)
-    service = extract_reason_quick(question)
+    service = extract_reason_quick(question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     if service:
         terms.update(_knowledge_terms(service))
     lower = question.lower()
@@ -431,6 +457,25 @@ def _question_topic_terms(question: str) -> set[str]:
         terms.update({"transit", "metro", "station", "bus", "subway", "train", "blocks"})
     if SERVICE_INFO_HINT_RE.search(lower):
         terms.update({"service", "services", "procedure", "procedures"})
+    # Spa-specific topic terms
+    if MEMBERSHIP_HINT_RE.search(lower):
+        terms.update({"membership", "member", "monthly", "package", "bundle", "series"})
+    if PRE_CARE_HINT_RE.search(lower):
+        terms.update({"pre", "care", "before", "prepare", "avoid"})
+    if POST_CARE_HINT_RE.search(lower):
+        terms.update({"post", "care", "after", "aftercare", "recovery", "downtime"})
+    if CONTRAINDICATION_HINT_RE.search(lower):
+        terms.update({"pregnant", "pregnancy", "allergy", "sensitive", "medication", "accutane", "retinol"})
+    if RESULTS_HINT_RE.search(lower):
+        terms.update({"results", "last", "effective", "expect"})
+    if CONSULTATION_HINT_RE.search(lower):
+        terms.update({"consultation", "consult", "first", "visit", "new"})
+    if GRATUITY_HINT_RE.search(lower):
+        terms.update({"tip", "gratuity", "tipping"})
+    if CANCELLATION_HINT_RE.search(lower):
+        terms.update({"cancel", "cancellation", "reschedule", "policy", "fee", "charge"})
+    if ARRIVAL_HINT_RE.search(lower):
+        terms.update({"arrive", "arrival", "early", "intake", "forms"})
     return terms
 
 
@@ -461,7 +506,7 @@ def _question_with_service_context(question: str, fallback_service: Optional[str
     service = " ".join(str(fallback_service or "").split()).strip()
     if not normalized or not service:
         return normalized
-    if extract_reason_quick(normalized):
+    if extract_reason_quick(normalized, industry_type=_GLOBAL_INDUSTRY_TYPE):
         return normalized
 
     lower_question = normalized.lower()
@@ -514,6 +559,25 @@ def _question_knowledge_categories(question: str) -> set[str]:
         categories.update({"logistics", "location"})
     if SERVICE_INFO_HINT_RE.search(lower):
         categories.update({"services", "pricing"})
+    # Spa-specific categories
+    if MEMBERSHIP_HINT_RE.search(lower):
+        categories.add("memberships")
+    if PRE_CARE_HINT_RE.search(lower):
+        categories.add("pre/post care")
+    if POST_CARE_HINT_RE.search(lower):
+        categories.add("pre/post care")
+    if CONTRAINDICATION_HINT_RE.search(lower):
+        categories.update({"pre/post care", "services"})
+    if RESULTS_HINT_RE.search(lower):
+        categories.add("services")
+    if CONSULTATION_HINT_RE.search(lower):
+        categories.add("new clients")
+    if GRATUITY_HINT_RE.search(lower):
+        categories.add("payment")
+    if CANCELLATION_HINT_RE.search(lower):
+        categories.add("policy")
+    if ARRIVAL_HINT_RE.search(lower):
+        categories.add("policy")
     return categories
 
 
@@ -573,7 +637,27 @@ def _knowledge_match_score(question: str, *, title: str, body: str, category: st
     if LOGISTICS_HINT_RE.search(lower_question) and LOGISTICS_HINT_RE.search(haystacks):
         score += 6
 
-    detected_service = extract_reason_quick(question)
+    # Spa-specific scoring boosts
+    if MEMBERSHIP_HINT_RE.search(lower_question) and MEMBERSHIP_HINT_RE.search(haystacks):
+        score += 8
+    if PRE_CARE_HINT_RE.search(lower_question) and PRE_CARE_HINT_RE.search(haystacks):
+        score += 6
+    if POST_CARE_HINT_RE.search(lower_question) and POST_CARE_HINT_RE.search(haystacks):
+        score += 6
+    if CONTRAINDICATION_HINT_RE.search(lower_question) and CONTRAINDICATION_HINT_RE.search(haystacks):
+        score += 6
+    if RESULTS_HINT_RE.search(lower_question) and RESULTS_HINT_RE.search(haystacks):
+        score += 6
+    if CONSULTATION_HINT_RE.search(lower_question) and CONSULTATION_HINT_RE.search(haystacks):
+        score += 6
+    if GRATUITY_HINT_RE.search(lower_question) and GRATUITY_HINT_RE.search(haystacks):
+        score += 8
+    if CANCELLATION_HINT_RE.search(lower_question) and CANCELLATION_HINT_RE.search(haystacks):
+        score += 6
+    if ARRIVAL_HINT_RE.search(lower_question) and ARRIVAL_HINT_RE.search(haystacks):
+        score += 6
+
+    detected_service = extract_reason_quick(question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     if detected_service and detected_service.lower() in haystacks:
         score += 8
     if DETAIL_REQUEST_RE.search(lower_question):
@@ -637,7 +721,7 @@ def _select_knowledge_articles_for_answer(
     # articles whose title+body actually contain a service-specific term.
     # This prevents unrelated articles (e.g. "Root Canal", "Night Guards") from
     # being included just because a generic word like "teeth" appears in them.
-    detected_service = extract_reason_quick(question)
+    detected_service = extract_reason_quick(question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     service_filter_terms = _service_specific_terms(detected_service) if detected_service else set()
 
     selected: list[Dict[str, str]] = []
@@ -679,7 +763,7 @@ def _render_knowledge_article(question: str, article: Dict[str, str]) -> str:
         details = body if body else title
         return _voice_answer_text(f"The doctor's name is {title}. {details}")
 
-    detected_service = extract_reason_quick(question)
+    detected_service = extract_reason_quick(question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     specific_terms = _question_specific_terms(question)
     wants_pricing = PRICING_HINT_RE.search(lower_question) is not None
     sentences = [
@@ -694,7 +778,7 @@ def _render_knowledge_article(question: str, article: Dict[str, str]) -> str:
             lower_sentence = sentence.lower()
             score = 0
             service_match = False
-            sentence_service = extract_reason_quick(sentence)
+            sentence_service = extract_reason_quick(sentence, industry_type=_GLOBAL_INDUSTRY_TYPE)
 
             if detected_service and sentence_service and sentence_service.lower() == detected_service.lower():
                 score += 18
@@ -724,7 +808,7 @@ def _render_knowledge_article(question: str, article: Dict[str, str]) -> str:
                 next_idx = best_idx + 1
                 if next_idx < len(sentences):
                     next_sentence = sentences[next_idx]
-                    next_service = extract_reason_quick(next_sentence)
+                    next_service = extract_reason_quick(next_sentence, industry_type=_GLOBAL_INDUSTRY_TYPE)
                     next_conflicts = bool(
                         detected_service
                         and next_service
@@ -759,7 +843,7 @@ def _service_focused_excerpt(question: str, body: str) -> Optional[str]:
     if not cleaned_body:
         return None
 
-    detected_service = extract_reason_quick(question)
+    detected_service = extract_reason_quick(question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     if not detected_service:
         return None
 
@@ -846,7 +930,7 @@ def _prune_sentences_for_service(text: str, detected_service: str) -> str:
         lower_sentence = sentence.lower()
 
         # Check 1: if extract_reason_quick recognises a DIFFERENT service, drop it
-        sentence_service = extract_reason_quick(sentence)
+        sentence_service = extract_reason_quick(sentence, industry_type=_GLOBAL_INDUSTRY_TYPE)
         if sentence_service and sentence_service.lower() != lower_target:
             continue
 
@@ -893,7 +977,7 @@ def _compose_knowledge_answer(question: str, articles: Sequence[Dict[str, str]])
     # Final safety net: remove sentences about other services when a specific
     # service was requested (e.g. asking about whitening should never include
     # root canal or night guard sentences, regardless of article structure).
-    detected_service = extract_reason_quick(question)
+    detected_service = extract_reason_quick(question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     if detected_service:
         result = _prune_sentences_for_service(result, detected_service)
 
@@ -943,7 +1027,7 @@ def compose_clinic_info_answer(
 
     routed_categories = _question_knowledge_categories(contextual_question)
     ranked_articles = _rank_knowledge_articles(contextual_question, normalized_articles)
-    detected_service = extract_reason_quick(contextual_question)
+    detected_service = extract_reason_quick(contextual_question, industry_type=_GLOBAL_INDUSTRY_TYPE)
     if routed_categories.intersection({"pricing", "services"}) and not detected_service:
         specific_terms = _question_specific_terms(contextual_question)
         top_specific_match = max(
@@ -1014,7 +1098,7 @@ def prune_clinic_response_for_tts(
 
     spoken_word_count = len(normalized_spoken.split())
     sanitized_word_count = len(sanitized.split())
-    detected_service = extract_reason_quick(contextual_question) or fallback_service
+    detected_service = extract_reason_quick(contextual_question, industry_type=_GLOBAL_INDUSTRY_TYPE) or fallback_service
 
     if _has_conflicting_service_mentions(normalized_spoken, detected_service):
         return sanitized
@@ -1055,6 +1139,7 @@ class AssistantTools:
         schedule: Optional[Dict[str, Any]] = None,
         clinic_tz: Optional[str] = None,
         knowledge_articles: Optional[Sequence[Dict[str, Any]]] = None,
+        industry_type: Optional[str] = None,
     ):
         self.state = state
         self._clinic_info: Dict[str, Any] = clinic_info if clinic_info is not None else (_GLOBAL_CLINIC_INFO or {})
@@ -1062,6 +1147,7 @@ class AssistantTools:
         self._schedule: Dict[str, Any] = schedule if schedule is not None else (_GLOBAL_SCHEDULE or {})
         self._clinic_tz: str = clinic_tz or _GLOBAL_CLINIC_TZ
         self._knowledge_articles: list[Dict[str, str]] = _normalize_knowledge_articles(knowledge_articles)
+        self._industry_type: str = industry_type or _GLOBAL_INDUSTRY_TYPE
         self._refresh_memory: Optional[Callable[[], None]] = None
         # Optional async callback for speaking a final response directly from a tool,
         # bypassing the LLM re-generation step. Set by agent.py after session is ready.
@@ -2023,6 +2109,170 @@ class AssistantTools:
         except Exception as e:
             logger.error(f"[RESCHEDULE] Error: {e}")
             return "I'm having trouble with that. Would you like to speak with the office directly?"
+
+    # =========================================================================
+    # Spa-specific tools (only used when industry_type == 'med_spa')
+    # =========================================================================
+
+    @llm.function_tool(
+        description=(
+            "Check if a condition is a contraindication for a spa service. "
+            "Returns 'safe_to_proceed', 'cannot_treat' (with reason), or 'consult_required'. "
+            "Only call for med spa clients."
+        )
+    )
+    async def check_contraindication(self, service_type: str, condition: str) -> str:
+        CONTRAINDICATION_RULES = {
+            "botox": {
+                "pregnant": "cannot_treat",
+                "breastfeeding": "cannot_treat",
+                "neurological_condition": "consult_required",
+            },
+            "dysport": {
+                "pregnant": "cannot_treat",
+                "breastfeeding": "cannot_treat",
+                "neurological_condition": "consult_required",
+            },
+            "filler": {
+                "pregnant": "cannot_treat",
+                "breastfeeding": "cannot_treat",
+            },
+            "lip filler": {
+                "pregnant": "cannot_treat",
+                "breastfeeding": "cannot_treat",
+            },
+            "laser": {
+                "recent_tan": "cannot_treat",
+                "active_sunburn": "cannot_treat",
+                "photosensitive_medication": "consult_required",
+            },
+            "ipl": {
+                "recent_tan": "cannot_treat",
+                "active_sunburn": "cannot_treat",
+                "photosensitive_medication": "consult_required",
+            },
+            "chemical_peel": {
+                "retinol_recent": "consult_required",
+                "accutane": "cannot_treat",
+                "open_wounds": "cannot_treat",
+            },
+            "waxing": {
+                "accutane": "cannot_treat",
+                "retinol_application_area": "cannot_treat",
+            },
+        }
+
+        service_lower = (service_type or "").strip().lower().replace(" ", "_")
+        condition_lower = (condition or "").strip().lower().replace(" ", "_")
+
+        # Try to match service key with partial matching
+        matched_rules = None
+        for key, rules in CONTRAINDICATION_RULES.items():
+            if key.replace(" ", "_") in service_lower or service_lower in key.replace(" ", "_"):
+                matched_rules = rules
+                break
+
+        if not matched_rules:
+            return "safe_to_proceed"
+
+        # Try to match condition
+        for cond_key, result in matched_rules.items():
+            if cond_key in condition_lower or condition_lower in cond_key:
+                if result == "cannot_treat":
+                    self.state.has_contraindication = True
+                    self.state.contraindication_detail = f"{service_type}: {condition}"
+                    _refresh_memory()
+                    return (
+                        f"Unfortunately, {condition} is a contraindication for {service_type} "
+                        f"and we wouldn't be able to proceed with that treatment. "
+                        f"Would you like to explore an alternative service, or I can book a consultation "
+                        f"so our specialist can discuss your options?"
+                    )
+                elif result == "consult_required":
+                    _refresh_memory()
+                    return (
+                        f"For {service_type} with {condition}, I'd recommend booking a consultation first "
+                        f"so our specialist can assess and create a personalized plan for you. "
+                        f"The consultation is about 30 minutes. Would you like to book that?"
+                    )
+
+        return "safe_to_proceed"
+
+    @llm.function_tool(
+        description=(
+            "Flag that a patch test is required for a spa service (laser, certain chemical peels, tinting). "
+            "Sets state and returns a message offering to book both patch test and treatment. "
+            "Only call for med spa clients."
+        )
+    )
+    async def flag_patch_test_required(self, service_type: str) -> str:
+        self.state.needs_patch_test = True
+        self.state.second_appointment_needed = True
+        _refresh_memory()
+        logger.info(f"[SPA] Patch test flagged for: {service_type}")
+        return (
+            f"For {service_type}, we typically do a quick patch test 48 hours before "
+            f"the treatment — it takes about 15 minutes. Would you like me to book both? "
+            f"I'll find you a patch test slot first, then your main treatment 48+ hours after."
+        )
+
+    @llm.function_tool(
+        description=(
+            "Book a second appointment for patch test + treatment combo. "
+            "Used after a patch test slot is booked and the main treatment needs scheduling. "
+            "Only call for med spa clients."
+        )
+    )
+    async def book_second_appointment(self, time_suggestion: str, service_type: str) -> str:
+        state = self.state
+        logger.info(f"[SPA] Booking second appointment: {service_type} at {time_suggestion}")
+
+        # Use the existing update_patient_record flow for the second booking
+        result = await self.update_patient_record(time_suggestion=time_suggestion, reason=service_type)
+        state.second_appointment_needed = False
+        state.patch_test_booked = True
+        _refresh_memory()
+        return result
+
+    @llm.function_tool(
+        description=(
+            "Record couples/duo booking details. Sets partner name and flags that two rooms/providers "
+            "are needed at the same time. Only call for med spa clients."
+        )
+    )
+    async def note_couples_booking(self, partner_name: str, partner_service: Optional[str] = None) -> str:
+        state = self.state
+        state.is_couples_booking = True
+        state.partner_name = (partner_name or "").strip().title()
+        _refresh_memory()
+        logger.info(f"[SPA] Couples booking: partner={state.partner_name}, service={partner_service}")
+
+        service_note = ""
+        if partner_service:
+            service_note = f" I've noted that they'd like a {partner_service}."
+
+        return (
+            f"I've noted this as a couples booking with {state.partner_name}.{service_note} "
+            f"I'll make sure we have two rooms available at the same time for you both."
+        )
+
+    @llm.function_tool(
+        description=(
+            "Record esthetician/provider preference. Saves the requested provider name "
+            "and acknowledges that availability is not guaranteed. Only call for med spa clients."
+        )
+    )
+    async def note_provider_preference(self, provider_name: str) -> str:
+        state = self.state
+        state.requested_provider = (provider_name or "").strip().title()
+        _refresh_memory()
+        logger.info(f"[SPA] Provider preference: {state.requested_provider}")
+        return (
+            f"I've noted your preference for {state.requested_provider}. "
+            f"I'll do my best to book with them, but I can't guarantee availability "
+            f"until we check the schedule. If they aren't available at your preferred time, "
+            f"would you like me to find their next available slot instead?"
+        )
 
     @llm.function_tool(description="End the call when the user says goodbye or conversation is complete.")
     async def end_conversation(self) -> str:

@@ -144,6 +144,20 @@ class PatientState:
     tz: str = DEFAULT_TZ
     patient_type: Optional[str] = None
 
+    # Spa-specific fields (default None/False so dental calls are unaffected)
+    is_first_visit: Optional[bool] = None
+    is_couples_booking: bool = False
+    partner_name: Optional[str] = None
+    requested_provider: Optional[str] = None
+    has_contraindication: bool = False
+    contraindication_detail: Optional[str] = None
+    needs_patch_test: bool = False
+    patch_test_booked: bool = False
+    has_gift_card: bool = False
+    is_membership_client: bool = False
+    pre_care_instructions_requested: bool = False
+    second_appointment_needed: bool = False  # for patch test + treatment combos
+
     def add_rejected_slot(self, dt: datetime, reason: str = "user_rejected"):
         key = dt.strftime("%Y-%m-%d %H:%M")
         self.rejected_slots.add(key)
