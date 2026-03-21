@@ -32,6 +32,20 @@ _NAME_STOPWORDS = {
     "thursday", "time", "today", "tomorrow", "tooth", "toothache", "tuesday",
     "use", "want", "wednesday", "whiten", "whitening", "would", "yeah",
     "yep", "yes",
+    # Speech fragments / filler words that are not names
+    "actually", "the", "one", "go", "going", "wanna", "well",
+    "uh", "um", "er", "hmm", "sure", "not",
+    "just", "really", "very", "also", "too", "about", "back", "here",
+    "there", "now", "then", "when", "where", "what", "how", "why",
+    "who", "get", "got", "let", "put", "set", "did", "does", "been",
+    "all", "any", "both", "each", "few", "more", "most", "other",
+    "some", "such", "than", "that", "these", "those", "through",
+    # Common verbs in speech that aren't names
+    "looking", "trying", "wanted", "needed", "booked", "spoke",
+    "called", "told", "said", "know", "think", "believe", "feel",
+    # Spa/dental service words that aren't names
+    "hydra", "facial", "massage", "botox", "laser", "filler",
+    "appointment", "service", "treatment",
 }
 
 
@@ -75,6 +89,10 @@ def _looks_like_standalone_name(text: str) -> Optional[str]:
     if not any(len(token) >= 3 for token in lowered):
         return None
     if any(not re.fullmatch(r"[A-Za-z][A-Za-z'.-]*", token) for token in tokens):
+        return None
+
+    # Single token <= 4 chars is too short to be a reliable standalone name
+    if len(tokens) == 1 and len(tokens[0]) <= 4:
         return None
 
     return candidate.title()
@@ -207,13 +225,97 @@ SPA_SERVICE_MAP = {
 }
 
 
+# Phonetic approximation map for common STT errors on spa/dental services
+_STT_APPROXIMATIONS: dict[str, str] = {
+    # HydraFacial variations
+    "hydro fish": "HydraFacial",
+    "hydro facial": "HydraFacial",
+    "hydra fish": "HydraFacial",
+    "hydra face": "HydraFacial",
+    "hydro face": "HydraFacial",
+    "hydra": "HydraFacial",
+    # Botox variations
+    "botoks": "Botox",
+    "bo tox": "Botox",
+    "bow tox": "Botox",
+    # Microneedling
+    "micro needling": "Microneedling",
+    "micro needing": "Microneedling",
+    "micro nettling": "Microneedling",
+    # Dermaplaning
+    "derma planning": "Dermaplaning",
+    "derma planing": "Dermaplaning",
+    "derma plan": "Dermaplaning",
+    # Microblading
+    "micro blading": "Microblading",
+    "micro blade": "Microblading",
+    "eyebrow tattoo": "Microblading",
+    # Lash lift
+    "lash left": "Lash Lift",
+    "lash list": "Lash Lift",
+    # Chemical peel
+    "chemical feel": "Chemical Peel",
+    "chemical pill": "Chemical Peel",
+    "chemical peal": "Chemical Peel",
+    # IPL
+    "i p l": "IPL Photofacial",
+    "i-p-l": "IPL Photofacial",
+    # Filler
+    "lip fill": "Lip Filler",
+    "dermal fill": "Dermal Filler",
+    # Laser hair
+    "laser here": "Laser Hair Removal",
+    "laser hair remove": "Laser Hair Removal",
+    # Massage variations
+    "sweedish": "Swedish Massage",
+    "swedish massage": "Swedish Massage",
+    "deep tissue massage": "Deep Tissue Massage",
+    "deep tissue massaj": "Deep Tissue Massage",
+    "hot stone massage": "Hot Stone Massage",
+    # Waxing
+    "brizilian": "Brazilian Wax",
+    "brazillian": "Brazilian Wax",
+    # Teeth whitening (dental)
+    "teeth white": "Teeth whitening",
+    "whitening teeth": "Teeth whitening",
+    "tooth whitening": "Teeth whitening",
+}
+
+
 def _match_service_map(text: str, service_map: dict[str, str]) -> Optional[str]:
-    """Match text against a service keyword map, trying longer keys first."""
-    t = text.lower()
-    # Sort by key length descending so "laser hair removal" matches before "laser"
+    """Match text against a service keyword map, trying longer keys first.
+    Checks STT approximations first (more specific multi-word patterns),
+    then falls back to exact substring match.
+    """
+    t = text.lower().strip()
+
+    # Pass 1: STT approximation map (checked first — more specific multi-word patterns)
+    for approx_key in sorted(_STT_APPROXIMATIONS.keys(), key=len, reverse=True):
+        if approx_key in t:
+            return _STT_APPROXIMATIONS[approx_key]
+
+    # Pass 2: Exact substring match
     for key in sorted(service_map.keys(), key=len, reverse=True):
         if key in t:
             return service_map[key]
+
+    # Pass 3: Token overlap scoring
+    # If 2+ significant tokens from a service name appear in the text, match it
+    t_tokens = set(re.findall(r'\b[a-z]{3,}\b', t))
+    if t_tokens:
+        best_score = 0
+        best_match = None
+        for key, canonical in service_map.items():
+            key_tokens = set(re.findall(r'\b[a-z]{3,}\b', key.lower()))
+            if not key_tokens:
+                continue
+            overlap = len(t_tokens & key_tokens)
+            if overlap >= min(2, len(key_tokens)) and overlap > best_score:
+                best_score = overlap
+                best_match = canonical
+        if best_match:
+            return best_match
+
     return None
 
 

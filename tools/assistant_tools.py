@@ -1497,11 +1497,14 @@ class AssistantTools:
                             state.caller_id_checked = True
                             _refresh_memory()
                             phone_prompt = _phone_confirmation_question(state, phone_candidate)
+                            # If name is also missing, ask for it first
+                            if not state.full_name:
+                                return f"Perfect. {day_spoken} at {time_spoken} is open. And what name should I put on the booking?"
                             return f"Perfect. {day_spoken} at {time_spoken} is open. {phone_prompt}"
 
                     _refresh_memory()
                     if not state.full_name:
-                        return f"Got it, {day_spoken} at {time_spoken} works. What name should I put on the appointment?"
+                        return f"Got it, {day_spoken} at {time_spoken} works. What name should I put on the booking?"
                     elif not state.reason:
                         return f"Got it, {day_spoken} at {time_spoken} works. What brings you in today?"
                     else:

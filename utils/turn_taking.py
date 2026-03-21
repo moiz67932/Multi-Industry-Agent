@@ -260,6 +260,11 @@ def _token_count(text: str) -> int:
     return len(re.findall(r"[a-z0-9']+", text.lower()))
 
 
+def _has_any_service_mention(text: str) -> bool:
+    """Check if text mentions any service (dental or spa)."""
+    return bool(extract_reason_quick(text, industry_type="dental") or extract_reason_quick(text, industry_type="med_spa"))
+
+
 def _is_weak_fragment(text: str, max_tokens: int) -> bool:
     normalized = _normalize_text(text).lower()
     if not normalized:
@@ -270,7 +275,7 @@ def _is_weak_fragment(text: str, max_tokens: int) -> bool:
         _token_count(normalized) <= max_tokens
         and not has_date_reference(normalized)
         and not has_time_reference(normalized)
-        and not extract_reason_quick(normalized)
+        and not _has_any_service_mention(normalized)
     )
 
 
@@ -321,8 +326,9 @@ def _state_has_time(state: PatientState) -> bool:
 
 
 class StreamingTurnTracker:
-    def __init__(self, config: TurnTakingConfig):
+    def __init__(self, config: TurnTakingConfig, *, industry_type: str = "dental"):
         self.config = config
+        self.industry_type = industry_type
         self._logical_turn_id = 0
         self._expected_user_slot: Optional[ExpectedUserSlot] = None
         self.snapshot = TurnTrackerSnapshot()
@@ -420,7 +426,7 @@ class StreamingTurnTracker:
         )
         snap.request_phrase_in_progress = bool(
             REQUEST_PREFIX_ONLY_RE.search(normalized)
-            or (REQUEST_LEAD_IN_RE.search(normalized) and not extract_reason_quick(text))
+            or (REQUEST_LEAD_IN_RE.search(normalized) and not extract_reason_quick(text, industry_type=self.industry_type))
             or SERVICE_REQUEST_RE.search(normalized)
         )
         snap.syntactically_incomplete = bool(
@@ -440,10 +446,10 @@ class StreamingTurnTracker:
             snap.caller_name = _strip_terminal_punctuation(detected_name)
             snap.caller_name_confidence = 0.95 if extract_name_quick(text) else 0.8
 
-        detected_service = extract_reason_quick(text) or patient_state.reason
+        detected_service = extract_reason_quick(text, industry_type=self.industry_type) or patient_state.reason
         if detected_service:
             snap.service = detected_service
-            snap.service_confidence = 0.92 if extract_reason_quick(text) else 0.8
+            snap.service_confidence = 0.92 if extract_reason_quick(text, industry_type=self.industry_type) else 0.8
 
         date_phrase = _extract_date_phrase(text)
         if date_phrase or _state_has_date(patient_state):
@@ -808,7 +814,8 @@ def choose_contextual_filler(snapshot: TurnTrackerSnapshot) -> Optional[str]:
     if snapshot.deterministic_response:
         return None
     if snapshot.intent == "clinic_info":
-        service = (snapshot.service or extract_reason_quick(snapshot.current_turn_accumulated_text or "") or "").strip()
+        _filler_text = snapshot.current_turn_accumulated_text or ""
+        service = (snapshot.service or extract_reason_quick(_filler_text, industry_type="dental") or extract_reason_quick(_filler_text, industry_type="med_spa") or "").strip()
         text = (snapshot.current_turn_accumulated_text or snapshot.latest_finalized_text or "").lower()
         if service:
             return f"Sure, let me pull the details on {service.lower()} for you."

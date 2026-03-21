@@ -411,6 +411,7 @@ BOOKING_CAPTURE_HINTS = (
     "book",
     "appointment",
     "schedule",
+    # Dental
     "cleaning",
     "consultation",
     "checkup",
@@ -420,6 +421,24 @@ BOOKING_CAPTURE_HINTS = (
     "filling",
     "crown",
     "root canal",
+    # Spa
+    "facial",
+    "hydrafacial",
+    "hydra",
+    "massage",
+    "botox",
+    "filler",
+    "laser",
+    "microneedling",
+    "dermaplaning",
+    "waxing",
+    "brazilian",
+    "microblading",
+    "lash",
+    "brow",
+    "chemical peel",
+    "manicure",
+    "pedicure",
 )
 INCOMPLETE_CAPTURE_RE = re.compile(
     r"(?:\b(?:at|on|for|around|between|this|next)\b|\b(?:uh|um|er|hmm)\b)[\s,.;:!?-]*$",
@@ -593,9 +612,16 @@ def _seed_state_from_recent_context(state: PatientState, schedule: dict[str, Any
     if not state.full_name:
         detected_name = extract_name_quick(recent_context)
         normalized_name = normalize_patient_name(detected_name)
+        # GUARD: Only accept names from explicit intro patterns, not standalone
+        # This prevents "Actually", "The One" etc. from being extracted
         if normalized_name:
-            state.full_name = normalized_name
-            updates.append(f"name={normalized_name}")
+            intro_pattern = re.compile(
+                r"\b(?:my\s+name\s+is|i\s+am|i'm|this\s+is|call\s+me)\s+",
+                re.IGNORECASE,
+            )
+            if intro_pattern.search(recent_context):
+                state.full_name = normalized_name
+                updates.append(f"name={normalized_name}")
 
     if not state.reason:
         detected_reason = extract_reason_quick(recent_context, industry_type=industry_type)
@@ -665,7 +691,10 @@ def _build_no_repeat_llm_instruction(state: PatientState, latest_user_text: str)
             )
         if state.reason:
             guards.append(
-                f"The reason is already saved as {state.reason}. Do not ask for the reason again unless they explicitly change it."
+                f"CRITICAL: The service/reason is already confirmed as '{state.reason}'. "
+                f"Do NOT ask 'what brings you in', 'what service', or any service-related "
+                f"question. The ONLY question you may ask next is: "
+                f"{_build_missing_slot_prompt(state)}"
             )
         if state.dt_local:
             dt_spoken = state.dt_local.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")
@@ -1164,7 +1193,7 @@ async def entrypoint(ctx: JobContext):
         expected_slot_weak_fragment_max_tokens=EXPECTED_SLOT_WEAK_FRAGMENT_MAX_TOKENS,
         expected_slot_enable_date_time_fast_path=EXPECTED_SLOT_ENABLE_DATE_TIME_FAST_PATH,
     )
-    turn_tracker = StreamingTurnTracker(turn_config)
+    turn_tracker = StreamingTurnTracker(turn_config, industry_type=industry_type)
     _turn_runtime: Dict[str, Any] = {
         "last_user_listening_started_at": None,
         "continuation_task": None,
@@ -1595,6 +1624,14 @@ async def entrypoint(ctx: JobContext):
                     turn_tracker.snapshot.current_turn_accumulated_text
                     or turn_tracker.snapshot.latest_finalized_text
                 ).strip()
+
+                # CRITICAL FIX: Mark response started BEFORE the async tool call.
+                # This prevents continuation fragments (like "At available.") from
+                # triggering a second fast-path invocation during the Supabase await.
+                turn_tracker.mark_main_response_started()
+                if mark_direct_response is not None:
+                    mark_direct_response()
+
                 logger.info(
                     f"[EXPECTED SLOT] satisfied={turn_tracker.snapshot.expected_user_slot or '-'} "
                     f"status={turn_tracker.snapshot.expected_slot_status or '-'} "
@@ -1611,9 +1648,6 @@ async def entrypoint(ctx: JobContext):
                 if turn_tracker.snapshot.filler_spoken_for_turn:
                     spoken_text = strip_duplicate_acknowledgement(spoken_text)
                 _apply_expected_slot_from_output(route=route, spoken_text=spoken_text)
-                if mark_direct_response is not None:
-                    mark_direct_response()
-                turn_tracker.mark_main_response_started()
                 if spoken_text:
                     _safe_say(spoken_text)
                 return True
@@ -1623,6 +1657,12 @@ async def entrypoint(ctx: JobContext):
                     turn_tracker.snapshot.current_turn_accumulated_text
                     or turn_tracker.snapshot.latest_finalized_text
                 ).strip()
+
+                # Mark response started BEFORE the async lookup
+                turn_tracker.mark_main_response_started()
+                if mark_direct_response is not None:
+                    mark_direct_response()
+
                 logger.info(
                     f"[FAST PATH] route={route} text='{question_text[:120]}' "
                     f"booked={state.appointment_booked}"
@@ -1635,9 +1675,6 @@ async def entrypoint(ctx: JobContext):
                 if turn_tracker.snapshot.filler_spoken_for_turn:
                     spoken_text = strip_duplicate_acknowledgement(spoken_text)
                 _apply_expected_slot_from_output(route=route, spoken_text=spoken_text)
-                if mark_direct_response is not None:
-                    mark_direct_response()
-                turn_tracker.mark_main_response_started()
                 if spoken_text:
                     _safe_say(spoken_text)
                 return True
@@ -1661,6 +1698,8 @@ async def entrypoint(ctx: JobContext):
             _turn_runtime["planned_filler_text"] = None
             _cancel_scheduled_filler()
             _interrupt_filler(force=True)
+            # Mark response started BEFORE the async lookup
+            turn_tracker.mark_main_response_started()
             await _run_lookup_with_bridge(
                 decision,
                 mark_direct_response=mark_direct_response,
@@ -1685,6 +1724,26 @@ async def entrypoint(ctx: JobContext):
             state.last_user_text or "",
         )
         if guarded_instruction:
+            # OPTIMIZATION: If only datetime is missing, use direct ask instead of LLM
+            missing = [s for s in state.missing_slots() if s != "phone_confirmed"]
+            if (
+                state.full_name
+                and state.reason
+                and not state.dt_local
+                and missing == ["datetime"]
+                and not state.dt_text
+            ):
+                ask_text = "Great! What day and time works for you?"
+                if industry_type == "med_spa":
+                    ask_text = f"You're going to love it! What day and time works best for your {state.reason}?"
+                if mark_direct_response is not None:
+                    mark_direct_response()
+                turn_tracker.mark_main_response_started()
+                _set_expected_slot(ExpectedUserSlot.DATE_TIME, reason="datetime_direct_ask")
+                _safe_say(ask_text)
+                logger.info(f"[FAST PATH] datetime_direct_ask bypassed LLM: '{ask_text}'")
+                return "stop"
+
             _turn_runtime["planned_filler_text"] = None
             logger.info("[LLM PATH] mode=guarded_stateful_fallback")
             await session.generate_reply(instructions=guarded_instruction)
@@ -2227,6 +2286,12 @@ async def entrypoint(ctx: JobContext):
                     or "number you are calling from" in lower
                     or "use this number" in lower
                     or "can i use the" in lower
+                    or "can i grab the number" in lower
+                    or "grab the number you're" in lower
+                    or "use the number you" in lower
+                    or "send your confirmation to" in lower
+                    or "send the confirmation to this" in lower
+                    or "reach you at" in lower
                 )
                 and (state.phone_e164 or getattr(state, "detected_phone", None) or getattr(state, "phone_pending", None))
             ):
